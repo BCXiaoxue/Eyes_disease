@@ -37,6 +37,7 @@ test/images/
 !.env.example
 data/retinascope.db
 data/predicted.csv
+data/*.csv
 artifacts/feedback/
 artifacts/reports/
 artifacts/chroma_db/
