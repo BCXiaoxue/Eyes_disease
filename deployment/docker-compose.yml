@@ -1,0 +1,89 @@
+services:
+  retinascope:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+      target: runtime
+    image: retinascope:latest
+    container_name: retinascope_app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+
+    env_file:
+      - ../.env
+    environment:
+      RETINASCOPE_ENABLE_SCORECAM: "1"
+
+    volumes:
+      # Model checkpoints.
+      - ../artifacts/models:/app/artifacts/models:ro
+      # Optional newly trained models.
+      - ../artifacts/new_models:/app/artifacts/new_models
+      # Persist clinician feedback and generated reports.
+      - ../artifacts/feedback:/app/artifacts/feedback
+      - ../artifacts/reports:/app/artifacts/reports
+      - ../artifacts/logs:/app/artifacts/logs
+      # Dataset inputs.
+      - ../data:/app/data:ro
+      - ../train/images:/app/train/images:ro
+
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+
+    # GPU deployment example:
+    # runtime: nvidia
+    # environment:
+    #   NVIDIA_VISIBLE_DEVICES: all
+    #   NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+  trainer:
+    profiles:
+      - train
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+      target: runtime
+    image: retinascope:latest
+    container_name: retinascope_trainer
+    env_file:
+      - ../.env
+    environment:
+      TRAIN_LABEL: "${TRAIN_LABEL:-N}"
+      TRAIN_EPOCHS: "${TRAIN_EPOCHS:-20}"
+      TRAIN_FOLDS: "${TRAIN_FOLDS:-5}"
+      TRAIN_BATCH: "${TRAIN_BATCH:-32}"
+    volumes:
+      - ../artifacts/models:/app/artifacts/models:ro
+      - ../artifacts/new_models:/app/artifacts/new_models
+      - ../artifacts/figs:/app/artifacts/figs
+      - ../artifacts/logs:/app/artifacts/logs
+      - ../data:/app/data:ro
+      - ../train/images:/app/train/images:ro
+    command:
+      - python
+      - training/baseline.py
+      - --csv
+      - /app/data/train.csv
+      - --img_dir
+      - /app/train/images/merged
+      - --label
+      - "${TRAIN_LABEL:-N}"
+      - --epochs
+      - "${TRAIN_EPOCHS:-20}"
+      - --folds
+      - "${TRAIN_FOLDS:-5}"
+      - --batch
+      - "${TRAIN_BATCH:-32}"
+      - --lr
+      - "${TRAIN_LR:-1e-4}"
+      - --lr_min
+      - "${TRAIN_LR_MIN:-1e-6}"
+      - --seed
+      - "${TRAIN_SEED:-42}"
+    # GPU deployment example:
+    # gpus: all

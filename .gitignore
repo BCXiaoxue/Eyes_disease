@@ -1,0 +1,57 @@
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# ==========================
+# Virtual Environment
+# ==========================
+.venv*/
+venv/
+env/
+ENV/
+
+# ==========================
+# Model Weights (too large for GitHub, >100MB per file)
+# Use Git LFS or cloud storage instead
+# ==========================
+artifacts/models/
+artifacts/new_models/
+
+# ==========================
+# Dataset Images (too large for GitHub)
+# Host on Kaggle / HuggingFace Datasets / cloud storage instead
+# ==========================
+train/images/
+test/images/
+
+# ==========================
+# Generated / Runtime Files
+# ==========================
+.env
+.env.*
+!.env.example
+data/retinascope.db
+data/predicted.csv
+artifacts/feedback/
+artifacts/reports/
+artifacts/chroma_db/
+artifacts/server_trained_models/
+artifacts/logs/
+
+# ==========================
+# IDE & OS
+# ==========================
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
+
+# ==========================
+# Streamlit cache
+# ==========================
+.streamlit/secrets.toml
