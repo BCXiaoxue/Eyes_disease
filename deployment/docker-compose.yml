@@ -13,16 +13,17 @@ services:
     env_file:
       - ../.env
     environment:
-      RETINASCOPE_ENABLE_SCORECAM: "1"
+      RETINASCOPE_MODEL_FILE: "${RETINASCOPE_MODEL_FILE:-best_swin_tiny_linear_asl.pth}"
+      RETINASCOPE_ENABLE_TTA: "${RETINASCOPE_ENABLE_TTA:-1}"
+      RETINASCOPE_TTA_EVAL_FILE: "${RETINASCOPE_TTA_EVAL_FILE:-eval_swin_tiny_linear_asl_tta.json}"
 
     volumes:
       # Model checkpoints.
       - ../artifacts/models:/app/artifacts/models:ro
       # Optional newly trained models.
       - ../artifacts/new_models:/app/artifacts/new_models
-      # Persist clinician feedback and generated reports.
+      # Persist clinician feedback.
       - ../artifacts/feedback:/app/artifacts/feedback
-      - ../artifacts/reports:/app/artifacts/reports
       - ../artifacts/logs:/app/artifacts/logs
       # Dataset inputs.
       - ../data:/app/data:ro

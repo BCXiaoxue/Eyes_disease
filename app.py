@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import base64
+import hashlib
 import html
 import io
 import json
@@ -6,7 +9,6 @@ import os
 import time
 from pathlib import Path
 
-import altair as alt
 import numpy as np
 import pandas as pd
 import requests
@@ -14,12 +16,12 @@ import streamlit as st
 import streamlit.components.v1 as components
 import torch
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageStat
-from wordcloud import WordCloud
 
-from utils.logger import save_feedback
-from utils.model import LABELS, predict
-from utils.paths import FEEDBACK_DIR, LABEL_CSV, MODELS_DIR, TRAIN_IMAGES_DIR
-from utils.storage import save_diagnosis_report
+from utils.consult import build_consult_messages
+from utils.logger import load_local_feedback, save_feedback
+from utils.model import LABELS, generate_cam, get_model_fingerprint, predict_scores
+from utils.multimodal import build_ai_consult_multimodal_context
+from utils.paths import LABEL_CSV, MODELS_DIR, TRAIN_IMAGES_DIR
 try:
     from utils import rag as _rag_module
     _RAG_AVAILABLE = True
@@ -46,9 +48,20 @@ def load_project_env():
 
 load_project_env()
 
+
+def local_image_data_uri(relative_path: str) -> str:
+    asset_path = Path(__file__).resolve().parent / relative_path
+    if not asset_path.exists():
+        return ""
+    ext = asset_path.suffix.lower().lstrip(".") or "png"
+    mime_ext = "jpeg" if ext in {"jpg", "jpeg"} else ext
+    encoded = base64.b64encode(asset_path.read_bytes()).decode("ascii")
+    return f"data:image/{mime_ext};base64,{encoded}"
+
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_API_BASE_URL = os.getenv("DEEPSEEK_API_BASE_URL", os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com"))
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+COPYRIGHT_TEXT = "Developed by Tian Sukai"
 DISEASE_NAMES = {
     "N": "Normal",
     "D": "Diabetes",
@@ -182,12 +195,87 @@ GRAPH_EDGES = [
     ("Macular OCT", "AMD"), ("Macular OCT", "Diabetic Retinopathy"), ("RNFL OCT", "Glaucoma"), ("Amsler Grid", "AMD"),
 ]
 
+GRAPH_NODE_LABELS = {node["id"]: node["label"] for node in GRAPH_NODES}
+GRAPH_DISEASE_IDS = {node["label_code"]: node["id"] for node in GRAPH_NODES if node.get("label_code")}
+DISEASE_QUERY_TERMS = {
+    "N": "正常眼底 无明显异常 常规筛查",
+    "D": "糖尿病视网膜病变 糖网 黄斑水肿 飞蚊 眼底出血",
+    "G": "青光眼 眼压升高 视野缺损 RNFL OCT",
+    "C": "白内障 晶状体混浊 眩光 视物模糊 裂隙灯",
+    "A": "AMD 年龄相关性黄斑变性 黄斑 视物变形 Amsler OCT",
+    "H": "高血压视网膜病变 高血压 眼底出血 视盘水肿",
+    "M": "病理性近视 高度近视 飞蚊 闪光 CNV OCT",
+    "O": "其他眼病 眼底异常 转诊 复查",
+}
 
-def image_merge(left_path: Path, right_path: Path, enhance: bool = True) -> Image.Image:
+
+def graph_neighbors(label: str) -> list[str]:
+    disease_id = GRAPH_DISEASE_IDS.get(label)
+    if not disease_id:
+        return []
+    neighbors = []
+    for left, right in GRAPH_EDGES:
+        if left == disease_id and right != "ODIR Labels":
+            neighbors.append(GRAPH_NODE_LABELS.get(right, right))
+        elif right == disease_id and left != "ODIR Labels":
+            neighbors.append(GRAPH_NODE_LABELS.get(left, left))
+    return neighbors
+
+
+def build_case_rag_query(symptoms="", additional_info="", patient_history="", patient_age=None, patient_sex=None) -> str:
+    active_predictions = st.session_state.get("active_predictions", {})
+    active_probabilities = st.session_state.get("active_probabilities", {})
+    active_labels = [label for label, value in active_predictions.items() if value == 1]
+    if not active_labels and active_probabilities:
+        active_labels = [max(active_probabilities, key=active_probabilities.get)]
+
+    query_parts = [symptoms, additional_info, patient_history]
+    patient_meta = st.session_state.get("active_patient_meta", {})
+    if patient_meta:
+        query_parts.append(f"年龄 {patient_meta.get('age', '')} 性别 {patient_meta.get('sex', '')}")
+    query_parts.append(patient_meta.get("left_keywords", ""))
+    query_parts.append(patient_meta.get("right_keywords", ""))
+    if patient_age is not None or patient_sex is not None:
+        query_parts.append(f"age {patient_age or ''} sex {patient_sex or ''}")
+    quality_summary = st.session_state.get("active_quality_summary", "")
+    if quality_summary:
+        query_parts.append(f"图像质量 {quality_summary}")
+    for label in active_labels:
+        query_parts.append(f"{label} {DISEASE_NAMES[label]} {DISEASE_QUERY_TERMS.get(label, '')}")
+    query_parts.append("转诊标准 红旗症状 建议检查")
+    return " ".join(str(part) for part in query_parts if str(part).strip())
+
+
+def render_rag_evidence(query: str, limit: int = 3):
+    if not _RAG_AVAILABLE or not query.strip():
+        return []
+    try:
+        evidence = _rag_module.explain_query(query, n_results=limit)
+    except Exception as exc:
+        st.caption(f"本地知识库检索暂不可用：{exc}")
+        return []
+    results = evidence.get("results", [])
+    if not results:
+        st.caption("本地知识库未检索到匹配片段。")
+        return []
+    st.caption(
+        "本地知识库命中："
+        + ", ".join(evidence.get("sources", []))
+        + "；关键词："
+        + "、".join(evidence.get("top_terms", [])[:8])
+    )
+    for result in results[:limit]:
+        preview = str(result["text"]).replace("\n", " ")[:180]
+        st.markdown(
+            f"- `{result['source']}` score={result['score']}：{preview}..."
+        )
+    return results
+
+
+def merge_eye_images(left_img: Image.Image, right_img: Image.Image, enhance: bool = True) -> Image.Image:
     """Merge left and right eye images into one side-by-side RGB image."""
-    left_img = Image.open(left_path).convert("RGB")
-    right_img = Image.open(right_path).convert("RGB")
-
+    left_img = left_img.convert("RGB")
+    right_img = right_img.convert("RGB")
     if enhance:
         left_img = ImageEnhance.Brightness(left_img).enhance(1.2)
         right_img = ImageEnhance.Brightness(right_img).enhance(1.2)
@@ -205,6 +293,12 @@ def image_merge(left_path: Path, right_path: Path, enhance: bool = True) -> Imag
     merged_img.paste(left_img, (0, 0))
     merged_img.paste(right_img, (left_img.width, 0))
     return merged_img
+
+
+def image_merge(left_path: Path, right_path: Path, enhance: bool = True) -> Image.Image:
+    """Load left/right image files and merge them into one side-by-side RGB image."""
+    with Image.open(left_path) as left_img, Image.open(right_path) as right_img:
+        return merge_eye_images(left_img, right_img, enhance=enhance)
 
 
 def highlight_pred(col, primary_color):
@@ -251,6 +345,17 @@ def image_to_base64(img: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode()
 
 
+def prediction_cache_key(name, image: Image.Image, device: str) -> str:
+    image = image.convert("RGB")
+    hasher = hashlib.sha256()
+    hasher.update(str(name).encode("utf-8", errors="ignore"))
+    hasher.update(str(device).encode("utf-8", errors="ignore"))
+    hasher.update(get_model_fingerprint(MODELS_DIR).encode("ascii"))
+    hasher.update(f"{image.mode}:{image.size}".encode("utf-8"))
+    hasher.update(image.tobytes())
+    return f"prediction_cache_{hasher.hexdigest()}"
+
+
 def show_image(image, caption=None, width=None, fill_width=False):
     """Render images across Streamlit versions."""
     if width is not None:
@@ -269,7 +374,7 @@ def render_cam_image(image, caption=None, max_width=460, max_height=320):
     image = image.convert("RGB")
     display = image.copy()
     display.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-    st.image(display, caption=caption, width=display.width)
+    st.image(display, caption=caption, width=min(display.width, max_width))
 
 
 def render_diagnostic_image(image, caption=None, max_width=520, max_height=320):
@@ -286,7 +391,7 @@ def render_diagnostic_image(image, caption=None, max_width=520, max_height=320):
         f"""
         <div class="diagnostic-image-wrap">
             <img src="data:image/png;base64,{image_b64}" alt="{html.escape(caption or 'Fundus image')}"
-                 style="max-width: {max_width}px; max-height: {max_height}px;">
+                 style="width: 100%; max-width: {max_width}px; max-height: {max_height}px; object-fit: contain;">
             {caption_html}
         </div>
         """,
@@ -325,22 +430,28 @@ def deepseek_chat_completions_url() -> str:
     return f"{base_url}/chat/completions"
 
 
-def call_deepseek_api_stream(prompt: str, api_key: str, message_placeholder):
+def call_deepseek_api_stream(messages: list[dict[str, str]], api_key: str, message_placeholder):
     """Call DeepSeek official chat completion API and stream the response into Streamlit."""
     if not api_key:
-        return "DEEPSEEK_API_KEY is not configured. Set the environment variable and restart the app."
+        raise RuntimeError("DeepSeek API key is not configured")
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": DEEPSEEK_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": True,
-        "temperature": 0.7,
-        "max_tokens": 2000,
+        "temperature": 0.3,
+        "max_tokens": 1600,
     }
 
     try:
-        response = requests.post(deepseek_chat_completions_url(), headers=headers, json=payload, stream=True, timeout=60)
+        response = requests.post(
+            deepseek_chat_completions_url(),
+            headers=headers,
+            json=payload,
+            stream=True,
+            timeout=(10, 60),
+        )
         response.raise_for_status()
         full_response = ""
         for line in response.iter_lines():
@@ -360,16 +471,15 @@ def call_deepseek_api_stream(prompt: str, api_key: str, message_placeholder):
             content = delta.get("content", "")
             if content:
                 full_response += content
-                message_placeholder.markdown(full_response + "...")
-                time.sleep(0.02)
+                message_placeholder.markdown(full_response + "▌")
+        if not full_response.strip():
+            raise RuntimeError("DeepSeek returned an empty response")
         message_placeholder.markdown(full_response)
         return full_response
-    except requests.exceptions.Timeout:
-        return "Request timed out. Please try again later."
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError("DeepSeek request timed out") from exc
     except requests.exceptions.RequestException as exc:
-        return f"Network error: {exc}"
-    except Exception as exc:
-        return f"Response processing error: {exc}"
+        raise RuntimeError("DeepSeek request failed") from exc
 
 
 @st.cache_data
@@ -397,21 +507,21 @@ def load_metadata() -> pd.DataFrame:
 
 def inject_theme(dark_mode: bool):
     colors = {
-        "bg": "#f8f5ef",
-        "surface": "#fffdf9",
+        "bg": "#f6faf8",
+        "surface": "#ffffff",
         "surface_raised": "#ffffff",
-        "text": "#35504d",
-        "muted": "#6f7d79",
-        "primary": "#4f9b8f",
-        "secondary": "#7aa874",
-        "accent": "#eef6f2",
-        "sidebar": "#f1eee6",
-        "form": "#fffdf9",
-        "border": "#ddd8cc",
-        "user": "#eef6f2",
-        "assistant": "#f6f1e8",
+        "text": "#102a27",
+        "muted": "#667874",
+        "primary": "#006b4e",
+        "secondary": "#16815f",
+        "accent": "#e8f6ef",
+        "sidebar": "#003f32",
+        "form": "#ffffff",
+        "border": "#dbe7e2",
+        "user": "#eaf7f1",
+        "assistant": "#f4f8f6",
         "warning": "#b7791f",
-        "danger": "#b65a4a",
+        "danger": "#d92d20",
     }
 
     st.markdown(
@@ -432,17 +542,19 @@ def inject_theme(dark_mode: bool):
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif !important;
         }}
         .stApp {{
-            background: {colors["bg"]};
+            background:
+                linear-gradient(180deg, #fbfdfc 0%, #f6faf8 48%, #eef7f2 100%);
             color: {colors["text"]};
         }}
         .block-container {{
-            padding-top: 1.2rem;
-            max-width: 1560px;
-            padding-left: 2rem !important;
-            padding-right: 2rem !important;
+            padding-top: 0.85rem;
+            max-width: 1680px;
+            padding-left: 2.25rem !important;
+            padding-right: 2.25rem !important;
         }}
         header[data-testid="stHeader"] {{
-            background: {colors["surface"]};
+            background: rgba(255,255,255,0.92);
+            backdrop-filter: blur(14px);
             border-bottom: 1px solid {colors["border"]};
             height: 42px;
         }}
@@ -464,44 +576,88 @@ def inject_theme(dark_mode: bool):
             box-shadow: none !important;
         }}
         section[data-testid="stSidebar"] {{
-            background: {colors["sidebar"]};
-            border-right: 1px solid {colors["border"]};
+            background:
+                linear-gradient(180deg, #004b3a 0%, #003f32 58%, #002b23 100%);
+            border-right: 1px solid rgba(255,255,255,0.10);
+            box-shadow: 18px 0 42px rgba(0, 63, 50, 0.13);
         }}
-        section[data-testid="stSidebar"] * {{
-            color: {colors["text"]} !important;
+        section[data-testid="stSidebar"] h1,
+        section[data-testid="stSidebar"] h2,
+        section[data-testid="stSidebar"] h3,
+        section[data-testid="stSidebar"] p,
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+        section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] * {{
+            color: rgba(255,255,255,0.92) !important;
         }}
         section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {{
             margin-bottom: 10px;
         }}
+        .sidebar-brand {{
+            padding: 8px 2px 18px;
+            margin-bottom: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.16);
+        }}
+        .sidebar-brand-mark {{
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 10px;
+            background: rgba(255,255,255,0.14);
+            border: 1px solid rgba(255,255,255,0.28);
+            color: #ffffff;
+            font-weight: 900;
+            vertical-align: middle;
+        }}
+        .sidebar-brand-text {{
+            display: inline-block;
+            vertical-align: middle;
+        }}
+        .sidebar-brand-title {{
+            color: #ffffff;
+            font-size: 20px;
+            font-weight: 850;
+            line-height: 1.05;
+        }}
+        .sidebar-brand-subtitle {{
+            color: rgba(255,255,255,0.72);
+            font-size: 12px;
+            margin-top: 3px;
+        }}
         div[data-baseweb="tab-list"] {{
-            gap: 2px;
-            border-bottom: 2px solid {colors["border"]};
-            padding-bottom: 0;
+            gap: 4px;
+            border-bottom: 1px solid {colors["border"]};
+            padding: 4px 0 0;
+            background: rgba(255,255,255,0.82);
         }}
         button[data-baseweb="tab"] {{
             border-radius: 8px 8px 0 0;
             background: transparent;
             border: 0;
             color: {colors["muted"]};
-            padding: 8px 11px;
-            font-weight: 500;
+            padding: 9px 15px;
+            font-weight: 650;
             font-size: 13px;
             letter-spacing: 0;
             transition: color 0.18s ease, background 0.18s ease;
             white-space: nowrap;
         }}
         button[data-baseweb="tab"][aria-selected="true"] {{
-            background: {colors["surface"]};
+            background: #ffffff;
             border-bottom: 3px solid {colors["primary"]};
             color: {colors["text"]};
-            font-weight: 650;
+            font-weight: 800;
+            box-shadow: 0 -1px 16px rgba(0,107,78,0.08);
         }}
         button[data-baseweb="tab"]:hover:not([aria-selected="true"]) {{
             color: {colors["primary"]};
-            background: rgba(79,155,143,0.07);
+            background: rgba(0,107,78,0.07);
         }}
         input::placeholder, textarea::placeholder {{
-            color: #6f7d79 !important;
+            color: #7b8985 !important;
             opacity: 1 !important;
         }}
         label,
@@ -512,6 +668,16 @@ def inject_theme(dark_mode: bool):
             color: {colors["text"]} !important;
             opacity: 1 !important;
         }}
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] [data-testid="stWidgetLabel"],
+        section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] *,
+        section[data-testid="stSidebar"] [data-baseweb="form-control"] label {{
+            color: rgba(255,255,255,0.92) !important;
+        }}
+        section[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+        section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] * {{
+            color: rgba(255,255,255,0.68) !important;
+        }}
         div[data-baseweb="input"],
         div[data-baseweb="textarea"],
         div[data-baseweb="select"] > div,
@@ -520,10 +686,11 @@ def inject_theme(dark_mode: bool):
         [data-testid="stTextInput"] input,
         [data-testid="stTextArea"] textarea,
         [data-testid="stNumberInput"] input {{
-            background: {colors["surface"]} !important;
+            background: #ffffff !important;
             color: {colors["text"]} !important;
             border-color: {colors["border"]} !important;
-            box-shadow: none !important;
+            border-radius: 8px !important;
+            box-shadow: 0 1px 0 rgba(16, 42, 39, 0.03) !important;
         }}
         div[data-baseweb="input"]:focus-within,
         div[data-baseweb="textarea"]:focus-within,
@@ -539,8 +706,8 @@ def inject_theme(dark_mode: bool):
             color: {colors["text"]} !important;
         }}
         [data-testid="stFileUploaderDropzone"] {{
-            background: #fbf8f1 !important;
-            border: 1px dashed #cfc7b8 !important;
+            background: #f6faf8 !important;
+            border: 1px dashed #b9cec6 !important;
             border-radius: 8px !important;
             color: {colors["text"]} !important;
         }}
@@ -588,7 +755,7 @@ def inject_theme(dark_mode: bool):
             font-size: 14px;
         }}
         .warm-table th {{
-            background: #f1eee6;
+            background: #f1f7f4;
             color: {colors["text"]};
             text-align: left;
             font-weight: 700;
@@ -600,28 +767,30 @@ def inject_theme(dark_mode: bool):
             background: {colors["surface"]};
             color: {colors["text"]};
             padding: 10px 12px;
-            border-bottom: 1px solid #eee8dd;
+            border-bottom: 1px solid #e7efeb;
             vertical-align: top;
             white-space: nowrap;
         }}
         .warm-table tr:nth-child(even) td {{
-            background: #fbf8f1;
+            background: #f8fbfa;
         }}
         .warm-table tr:last-child td {{
             border-bottom: 0;
         }}
         .clinical-hero {{
-            padding: 14px 18px;
+            padding: 22px 24px;
             border-radius: 8px;
-            margin-bottom: 12px;
+            margin-bottom: 16px;
             color: {colors["text"]};
-            background: {colors["surface"]};
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(236,248,242,0.98) 58%, rgba(250,253,251,0.98) 100%);
             border: 1px solid {colors["border"]};
-            box-shadow: none;
+            box-shadow: 0 12px 30px rgba(0, 63, 50, 0.07);
         }}
         .clinical-hero h1 {{
             margin: 0;
-            font-size: 22px;
+            font-size: 30px;
+            font-weight: 850;
             letter-spacing: 0;
         }}
         .clinical-hero p {{
@@ -629,6 +798,38 @@ def inject_theme(dark_mode: bool):
             max-width: 760px;
             color: {colors["muted"]};
             font-size: 14px;
+        }}
+        .hero-layout {{
+            display: grid;
+            grid-template-columns: minmax(0, 1.55fr) minmax(360px, .9fr);
+            gap: 22px;
+            align-items: center;
+        }}
+        .hero-kicker {{
+            color: {colors["primary"]};
+            font-size: 12px;
+            font-weight: 850;
+            letter-spacing: .12em;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }}
+        .hero-chips {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 15px;
+        }}
+        .hero-status-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }}
+        .hero-status-grid .stat-card {{
+            margin: 0;
+            min-height: 104px;
+        }}
+        .hero-status-grid .stat-value {{
+            font-size: 22px !important;
         }}
         .clinical-hero .hero-mark {{
             display: none;
@@ -640,11 +841,12 @@ def inject_theme(dark_mode: bool):
             border-radius: 8px;
             padding: 18px;
             margin: 12px 0;
-            box-shadow: none;
+            box-shadow: 0 8px 22px rgba(0, 63, 50, 0.045);
         }}
         .stat-card {{
-            text-align: center;
+            text-align: left;
             border-left-width: 1px;
+            min-height: 132px;
         }}
         .stat-value {{
             color: {colors["primary"]};
@@ -661,26 +863,231 @@ def inject_theme(dark_mode: bool):
             font-size: 12px;
             margin-top: 5px;
         }}
+        .overview-panel {{
+            display: grid;
+            grid-template-columns: minmax(420px, 1fr) minmax(0, 1.15fr);
+            gap: 18px;
+            align-items: stretch;
+            margin: 4px 0 8px;
+        }}
+        .overview-copy,
+        .flow-item {{
+            border: 1px solid {colors["border"]};
+            border-radius: 8px;
+            background: {colors["surface"]};
+            box-shadow: 0 6px 18px rgba(0, 63, 50, 0.04);
+        }}
+        .overview-copy {{
+            padding: 20px;
+        }}
+        .overview-copy h2 {{
+            margin: 4px 0 8px;
+            font-size: 22px;
+            line-height: 1.25;
+            letter-spacing: 0;
+            color: {colors["text"]};
+        }}
+        .overview-copy p {{
+            margin: 0;
+            color: {colors["muted"]};
+            line-height: 1.72;
+            font-size: 14px;
+        }}
+        .section-kicker {{
+            color: {colors["primary"]};
+            font-size: 12px;
+            font-weight: 850;
+            letter-spacing: .11em;
+            text-transform: uppercase;
+        }}
+        .overview-flow {{
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+        }}
+        .flow-item {{
+            padding: 16px;
+            min-height: 126px;
+        }}
+        .flow-item strong {{
+            display: block;
+            color: {colors["text"]};
+            font-size: 14px;
+            margin-bottom: 8px;
+        }}
+        .flow-item span {{
+            color: {colors["muted"]};
+            font-size: 12.5px;
+            line-height: 1.65;
+        }}
+        .overview-carousel {{
+            position: relative;
+            min-height: 390px;
+            border: 1px solid {colors["border"]};
+            border-radius: 8px;
+            overflow: hidden;
+            background: {colors["surface"]};
+            box-shadow: 0 10px 26px rgba(0, 63, 50, 0.06);
+        }}
+        .overview-slide {{
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            animation: overviewSlide 18s infinite;
+        }}
+        .overview-slide:nth-child(2) {{ animation-delay: 6s; }}
+        .overview-slide:nth-child(3) {{ animation-delay: 12s; }}
+        @keyframes overviewSlide {{
+            0%, 28% {{ opacity: 1; transform: scale(1); }}
+            34%, 100% {{ opacity: 0; transform: scale(1.018); }}
+        }}
+        .overview-slide img {{
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }}
+        .overview-slide::after {{
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(180deg, rgba(20,42,38,0.02), rgba(20,42,38,0.56));
+        }}
+        .overview-slide-caption {{
+            position: absolute;
+            left: 20px;
+            right: 20px;
+            bottom: 18px;
+            z-index: 2;
+            color: #ffffff;
+        }}
+        .overview-slide-caption strong {{
+            display: block;
+            font-size: 19px;
+            margin-bottom: 4px;
+        }}
+        .overview-slide-caption span {{
+            font-size: 12.5px;
+            opacity: .9;
+        }}
+        .overview-source {{
+            color: {colors["muted"]};
+            font-size: 11px;
+            margin-top: 6px;
+            opacity: .72;
+        }}
+        .page-header {{
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 18px 20px;
+            margin: 4px 0 14px;
+            border: 1px solid {colors["border"]};
+            border-radius: 8px;
+            background: rgba(255,255,255,0.94);
+            box-shadow: 0 8px 22px rgba(0, 63, 50, 0.045);
+        }}
+        .page-header h2 {{
+            margin: 0;
+            color: {colors["text"]};
+            font-size: 25px;
+            font-weight: 820;
+            letter-spacing: 0;
+        }}
+        .page-header p {{
+            margin: 7px 0 0;
+            max-width: 780px;
+            color: {colors["muted"]};
+            font-size: 13.5px;
+            line-height: 1.65;
+        }}
+        .page-chip-row {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: flex-end;
+        }}
+        .soft-panel {{
+            border: 1px solid {colors["border"]};
+            border-radius: 8px;
+            background: rgba(255,255,255,0.88);
+            padding: 16px;
+            box-shadow: 0 6px 18px rgba(0, 63, 50, 0.04);
+            margin: 10px 0 14px;
+        }}
+        .filter-panel {{
+            border: 1px solid {colors["border"]};
+            border-radius: 8px;
+            background: #ffffff;
+            padding: 14px 14px 4px;
+            margin: 10px 0 14px;
+        }}
+        .meta-strip {{
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin: 10px 0 12px;
+        }}
+        .meta-pill {{
+            border: 1px solid {colors["border"]};
+            border-radius: 8px;
+            background: #ffffff;
+            padding: 11px 12px;
+        }}
+        .meta-pill b {{
+            display: block;
+            color: {colors["text"]};
+            font-size: 13px;
+            margin-bottom: 4px;
+        }}
+        .meta-pill span {{
+            color: {colors["muted"]};
+            font-size: 12px;
+            line-height: 1.45;
+        }}
+        .empty-state {{
+            border: 1px dashed #b9cec6;
+            border-radius: 8px;
+            background: #ffffff;
+            padding: 24px;
+            color: {colors["muted"]};
+            text-align: center;
+            margin: 14px 0;
+        }}
+        .quiet-copyright {{
+            position: fixed;
+            left: 20px;
+            bottom: 12px;
+            max-width: 245px;
+            color: rgba(255,255,255,0.68) !important;
+            font-size: 11px !important;
+            opacity: .82;
+            line-height: 1.35;
+            pointer-events: none;
+        }}
         .risk-row {{
             display: grid;
             grid-template-columns: 42px minmax(130px, 1.1fr) minmax(150px, 2fr) 58px;
             gap: 12px;
             align-items: center;
-            padding: 8px 10px;
-            margin-bottom: 6px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
             border: 1px solid {colors["border"]};
-            border-radius: 6px;
+            border-radius: 8px;
             background: {colors["surface"]};
+            box-shadow: 0 2px 8px rgba(0, 63, 50, 0.025);
         }}
         .risk-row.positive {{
-            border-color: #b7d8ce;
+            border-color: #a9d8ca;
             background: #f0faf5;
         }}
         .risk-row.high {{
-            border-color: #b7d8ce;
+            border-color: #a9d8ca;
+            box-shadow: inset 3px 0 0 {colors["danger"]}, 0 2px 8px rgba(0,107,78,0.08);
         }}
         .risk-row.medium {{
-            border-color: #e2c889;
+            border-color: #e7c36a;
         }}
         .risk-level {{
             font-size: 11px;
@@ -698,7 +1105,7 @@ def inject_theme(dark_mode: bool):
         .risk-track {{
             height: 8px;
             border-radius: 999px;
-            background: #e8e3d8;
+            background: #e4ece8;
             overflow: hidden;
         }}
         .risk-fill {{
@@ -739,7 +1146,7 @@ def inject_theme(dark_mode: bool):
         }}
         .insight-note {{
             border: 1px solid {colors["border"]};
-            border-left: 4px solid {colors["secondary"]};
+            border-left: 4px solid {colors["primary"]};
             border-radius: 8px;
             padding: 12px 14px;
             margin: 10px 0;
@@ -747,13 +1154,13 @@ def inject_theme(dark_mode: bool):
             color: {colors["text"]};
         }}
         .stButton > button {{
-            border-radius: 22px;
-            border: 1.5px solid {colors["border"]};
+            border-radius: 8px;
+            border: 1px solid {colors["border"]};
             background: {colors["surface"]};
             color: {colors["text"]};
-            min-height: 36px;
+            min-height: 38px;
             padding: 0 20px;
-            font-weight: 500;
+            font-weight: 700;
             font-size: 13.5px;
             letter-spacing: 0.01em;
             transition: all 0.2s ease;
@@ -762,15 +1169,15 @@ def inject_theme(dark_mode: bool):
             border-color: {colors["primary"]};
             color: {colors["primary"]};
             background: rgba(79,155,143,0.06);
-            box-shadow: 0 2px 10px rgba(79,155,143,0.15);
+            box-shadow: 0 2px 10px rgba(0,107,78,0.15);
         }}
         button[kind="primary"] {{
-            background: linear-gradient(135deg, {colors["primary"]} 0%, {colors["secondary"]} 100%) !important;
+            background: {colors["primary"]} !important;
             border: 0 !important;
-            border-radius: 22px !important;
+            border-radius: 8px !important;
             color: white !important;
             font-weight: 650 !important;
-            box-shadow: 0 3px 14px rgba(79,155,143,0.35) !important;
+            box-shadow: 0 4px 14px rgba(0,107,78,0.22) !important;
         }}
         .chat-container {{
             max-height: 560px;
@@ -859,294 +1266,6 @@ def inject_theme(dark_mode: bool):
     return colors
 
 
-def render_hero():
-    carousel_html = """<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
-    background: transparent;
-    overflow: hidden;
-}
-.carousel-wrap {
-    position: relative;
-    width: 100%;
-    border-radius: 18px;
-    overflow: hidden;
-    box-shadow: 0 6px 40px rgba(20, 80, 90, 0.14);
-    height: 380px;
-    margin-bottom: 4px;
-}
-.carousel-track {
-    display: flex;
-    height: 100%;
-    transition: transform 0.68s cubic-bezier(0.35, 0, 0.15, 1);
-    will-change: transform;
-}
-.carousel-slide {
-    min-width: 100%;
-    height: 100%;
-    position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: hidden;
-}
-/* Slide backgrounds */
-.s1 { background: linear-gradient(135deg, #daeef7 0%, #b2ddf0 45%, #84c8e8 100%); }
-.s2 { background: linear-gradient(135deg, #d5f0e4 0%, #a8e0c6 45%, #74caa4 100%); }
-.s3 { background: linear-gradient(135deg, #d8eef0 0%, #a8d8dd 45%, #78bfc8 100%); }
-
-/* Decorative SVG bg */
-.slide-deco {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: none;
-}
-/* Right-side illustration */
-.slide-illo {
-    position: absolute;
-    right: 60px;
-    bottom: 0;
-    opacity: 0.11;
-    pointer-events: none;
-}
-/* Content */
-.slide-content {
-    position: relative;
-    z-index: 3;
-    text-align: center;
-    padding: 0 52px;
-    max-width: 740px;
-}
-.slide-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    background: rgba(255,255,255,0.82);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
-    border-radius: 24px;
-    padding: 7px 18px;
-    font-size: 11.5px;
-    font-weight: 700;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    margin-bottom: 22px;
-    color: #0e5a72;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
-}
-.slide-title {
-    font-size: 40px;
-    font-weight: 800;
-    line-height: 1.12;
-    margin-bottom: 16px;
-    letter-spacing: -0.025em;
-}
-.s1 .slide-title { color: #0a3d52; }
-.s2 .slide-title { color: #0a4030; }
-.s3 .slide-title { color: #0a3c42; }
-.slide-desc {
-    font-size: 15.5px;
-    line-height: 1.72;
-    max-width: 530px;
-    margin: 0 auto;
-}
-.s1 .slide-desc { color: #1a6080; }
-.s2 .slide-desc { color: #1a5a44; }
-.s3 .slide-desc { color: #1a5060; }
-
-/* Nav buttons */
-.nav-btn {
-    position: absolute;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 50px;
-    height: 50px;
-    border-radius: 50%;
-    background: rgba(255,255,255,0.78);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
-    border: none;
-    font-size: 26px;
-    line-height: 1;
-    cursor: pointer;
-    z-index: 20;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.22s ease;
-    color: #0a4055;
-    box-shadow: 0 2px 18px rgba(0,0,0,0.13);
-    -webkit-user-select: none;
-    user-select: none;
-}
-.nav-btn:hover {
-    background: rgba(255,255,255,0.95);
-    box-shadow: 0 4px 28px rgba(0,0,0,0.18);
-    transform: translateY(-50%) scale(1.07);
-}
-.prev-btn { left: 22px; }
-.next-btn { right: 22px; }
-
-/* Indicators */
-.indicators {
-    position: absolute;
-    bottom: 22px;
-    left: 50%;
-    transform: translateX(-50%);
-    display: flex;
-    gap: 9px;
-    z-index: 20;
-}
-.dot {
-    height: 8px;
-    width: 8px;
-    border-radius: 4px;
-    background: rgba(255,255,255,0.48);
-    cursor: pointer;
-    transition: all 0.32s ease;
-}
-.dot.active {
-    background: rgba(255,255,255,0.93);
-    width: 30px;
-}
-
-@media (max-width: 768px) {
-    .carousel-wrap { height: 240px; border-radius: 12px; }
-    .slide-title { font-size: 22px; }
-    .slide-desc { font-size: 13px; }
-    .slide-content { padding: 0 24px; }
-    .slide-badge { font-size: 10px; padding: 5px 13px; margin-bottom: 14px; }
-    .nav-btn { width: 38px; height: 38px; font-size: 20px; }
-    .prev-btn { left: 10px; }
-    .next-btn { right: 10px; }
-    .slide-illo { display: none; }
-}
-</style>
-</head>
-<body>
-<div class="carousel-wrap">
-  <div class="carousel-track" id="track">
-
-    <!-- Slide 1: Blue — AI Analysis -->
-    <div class="carousel-slide s1">
-      <svg class="slide-deco" viewBox="0 0 1200 380" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="80" cy="55" r="160" fill="#7dd3fc" opacity="0.38"/>
-        <circle cx="1150" cy="330" r="200" fill="#38bdf8" opacity="0.28"/>
-        <circle cx="920" cy="40" r="100" fill="#0ea5e9" opacity="0.18"/>
-        <circle cx="240" cy="350" r="70" fill="#7dd3fc" opacity="0.22"/>
-        <path d="M0 195 Q300 175 600 195 Q900 215 1200 195" stroke="#38bdf8" stroke-width="1.2" fill="none" opacity="0.35"/>
-        <path d="M0 215 Q300 235 600 215 Q900 195 1200 215" stroke="#38bdf8" stroke-width="0.8" fill="none" opacity="0.22"/>
-        <circle cx="600" cy="30" r="4" fill="#0ea5e9" opacity="0.4"/>
-        <circle cx="750" cy="350" r="5" fill="#38bdf8" opacity="0.35"/>
-        <circle cx="400" cy="20" r="3" fill="#7dd3fc" opacity="0.5"/>
-      </svg>
-      <svg class="slide-illo" width="260" height="260" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-        <ellipse cx="50" cy="50" rx="46" ry="30" stroke="#0a3d52" stroke-width="3.5" fill="none"/>
-        <circle cx="50" cy="50" r="18" stroke="#0a3d52" stroke-width="3" fill="none"/>
-        <circle cx="50" cy="50" r="9" fill="#0a3d52"/>
-        <circle cx="43" cy="43" r="3.5" fill="white" opacity="0.6"/>
-        <line x1="50" y1="5" x2="50" y2="20" stroke="#0a3d52" stroke-width="2" opacity="0.5"/>
-        <line x1="50" y1="80" x2="50" y2="95" stroke="#0a3d52" stroke-width="2" opacity="0.5"/>
-        <line x1="5" y1="50" x2="20" y2="50" stroke="#0a3d52" stroke-width="2" opacity="0.5"/>
-        <line x1="80" y1="50" x2="95" y2="50" stroke="#0a3d52" stroke-width="2" opacity="0.5"/>
-      </svg>
-      <div class="slide-content">
-        <div class="slide-badge">&#10008;&nbsp; AI 辅助诊断</div>
-        <div class="slide-title">智能眼底影像分析系统</div>
-        <div class="slide-desc">融合深度学习与临床医学知识，精准辅助医生识别眼部疾病，让每一张眼底照片都得到最严谨的审视与关怀</div>
-      </div>
-    </div>
-
-    <!-- Slide 2: Green — Disease Coverage -->
-    <div class="carousel-slide s2">
-      <svg class="slide-deco" viewBox="0 0 1200 380" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="90" cy="65" r="170" fill="#86efac" opacity="0.38"/>
-        <circle cx="1140" cy="320" r="210" fill="#4ade80" opacity="0.28"/>
-        <circle cx="940" cy="45" r="110" fill="#22c55e" opacity="0.16"/>
-        <circle cx="220" cy="340" r="75" fill="#86efac" opacity="0.22"/>
-        <path d="M0 190 Q300 172 600 190 Q900 208 1200 190" stroke="#22c55e" stroke-width="1.2" fill="none" opacity="0.35"/>
-        <path d="M0 210 Q300 228 600 210 Q900 192 1200 210" stroke="#22c55e" stroke-width="0.8" fill="none" opacity="0.22"/>
-        <circle cx="580" cy="28" r="4" fill="#4ade80" opacity="0.45"/>
-        <circle cx="760" cy="352" r="5" fill="#22c55e" opacity="0.35"/>
-      </svg>
-      <svg class="slide-illo" width="240" height="240" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-        <rect x="40" y="12" width="20" height="76" rx="5" fill="#0a4030"/>
-        <rect x="12" y="40" width="76" height="20" rx="5" fill="#0a4030"/>
-        <circle cx="50" cy="50" r="42" stroke="#0a4030" stroke-width="2" fill="none" opacity="0.25"/>
-      </svg>
-      <div class="slide-content">
-        <div class="slide-badge">&#9670;&nbsp; 多病种覆盖</div>
-        <div class="slide-title">八类眼部疾病精准识别</div>
-        <div class="slide-desc">涵盖糖尿病视网膜病变、青光眼、白内障、AMD等8类常见眼部疾病，基于多折叠 ConvNeXt 模型全方位守护您的视力健康</div>
-      </div>
-    </div>
-
-    <!-- Slide 3: Teal — Warm Care -->
-    <div class="carousel-slide s3">
-      <svg class="slide-deco" viewBox="0 0 1200 380" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="85" cy="60" r="165" fill="#5eead4" opacity="0.38"/>
-        <circle cx="1145" cy="325" r="205" fill="#2dd4bf" opacity="0.28"/>
-        <circle cx="930" cy="42" r="105" fill="#14b8a6" opacity="0.18"/>
-        <circle cx="230" cy="345" r="72" fill="#5eead4" opacity="0.22"/>
-        <path d="M0 192 Q300 173 600 192 Q900 211 1200 192" stroke="#14b8a6" stroke-width="1.2" fill="none" opacity="0.38"/>
-        <path d="M0 212 Q300 231 600 212 Q900 193 1200 212" stroke="#14b8a6" stroke-width="0.8" fill="none" opacity="0.22"/>
-        <circle cx="590" cy="30" r="4" fill="#2dd4bf" opacity="0.45"/>
-        <circle cx="755" cy="350" r="5" fill="#14b8a6" opacity="0.38"/>
-      </svg>
-      <svg class="slide-illo" width="250" height="250" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-        <path d="M50 88 C8 62 4 24 26 17 C37 13 46 20 50 30 C54 20 63 13 74 17 C96 24 92 62 50 88Z" fill="#0a3c42"/>
-        <circle cx="50" cy="42" r="10" fill="white" opacity="0.25"/>
-        <line x1="50" y1="32" x2="50" y2="52" stroke="white" stroke-width="2.5" opacity="0.4"/>
-        <line x1="40" y1="42" x2="60" y2="42" stroke="white" stroke-width="2.5" opacity="0.4"/>
-      </svg>
-      <div class="slide-content">
-        <div class="slide-badge">&#9829;&nbsp; 温暖医疗</div>
-        <div class="slide-title">以患者为中心的临床体验</div>
-        <div class="slide-desc">简洁直观的操作界面配合科学的临床工作流，让医生专注于判断与关怀，为患者带来更安心、更温暖的就医体验</div>
-      </div>
-    </div>
-
-  </div>
-
-  <button class="nav-btn prev-btn" onclick="move(-1)">&#8249;</button>
-  <button class="nav-btn next-btn" onclick="move(1)">&#8250;</button>
-
-  <div class="indicators">
-    <div class="dot active" onclick="go(0)"></div>
-    <div class="dot" onclick="go(1)"></div>
-    <div class="dot" onclick="go(2)"></div>
-  </div>
-</div>
-
-<script>
-var cur = 0, total = 3, timer;
-var track = document.getElementById('track');
-var dots = document.querySelectorAll('.dot');
-
-function update() {
-    track.style.transform = 'translateX(-' + (cur * 100) + '%)';
-    dots.forEach(function(d, i) { d.classList.toggle('active', i === cur); });
-}
-function move(dir) { cur = (cur + dir + total) % total; update(); reset(); }
-function go(i) { cur = i; update(); reset(); }
-function reset() {
-    clearInterval(timer);
-    timer = setInterval(function() { move(1); }, 5000);
-}
-reset();
-</script>
-</body>
-</html>"""
-    components.html(carousel_html, height=410, scrolling=False)
-
-
 def inject_night_refinement(colors):
     st.markdown(
         f"""
@@ -1191,7 +1310,7 @@ def inject_night_refinement(colors):
             line-height: 1.55;
         }}
         .handoff-card {{
-            background: #fbf8f1;
+            background: #f7fbf9;
             border: 1px solid {colors["border"]};
             border-radius: 8px;
             padding: 14px;
@@ -1208,8 +1327,8 @@ def inject_night_refinement(colors):
             line-height: 1.55;
         }}
         .quiet-note {{
-            border-left: 3px solid #d5ad55;
-            background: #fff8eb;
+            border-left: 3px solid {colors["warning"]};
+            background: #fffaf0;
             color: {colors["text"]};
             padding: 12px 14px;
             border-radius: 8px;
@@ -1266,7 +1385,7 @@ def inject_night_refinement(colors):
             padding: 5px 9px;
             border: 1px solid {colors["border"]};
             border-radius: 999px;
-            background: #fbf8f1;
+            background: #f0faf5;
             color: {colors["text"]};
             font-size: 12px;
         }}
@@ -1281,45 +1400,45 @@ def inject_night_refinement(colors):
         /* ── Premium card & layout enhancements ── */
         .feature-card, .knowledge-card {{
             transition: transform 0.22s ease, box-shadow 0.22s ease;
-            box-shadow: 0 2px 14px rgba(30,90,80,0.07);
+            box-shadow: 0 2px 14px rgba(0,63,50,0.07);
         }}
         .feature-card:hover, .knowledge-card:hover {{
-            transform: translateY(-4px);
-            box-shadow: 0 10px 32px rgba(30,90,80,0.13);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 32px rgba(0,63,50,0.11);
         }}
         .pipeline-step {{
             transition: transform 0.2s ease, box-shadow 0.2s ease;
-            box-shadow: 0 2px 10px rgba(30,90,80,0.06);
+            box-shadow: 0 2px 10px rgba(0,63,50,0.06);
         }}
         .pipeline-step:hover {{
-            transform: translateY(-3px);
-            box-shadow: 0 6px 22px rgba(30,90,80,0.11);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 22px rgba(0,63,50,0.10);
         }}
         .section-header h2 {{
             font-size: 28px !important;
             font-weight: 750 !important;
-            letter-spacing: -0.022em !important;
+            letter-spacing: 0 !important;
         }}
         .section-header p {{
             font-size: 15px !important;
             line-height: 1.65 !important;
         }}
         .stat-card {{
-            box-shadow: 0 2px 14px rgba(30,90,80,0.07);
+            box-shadow: 0 2px 14px rgba(0,63,50,0.07);
             transition: transform 0.22s ease, box-shadow 0.22s ease;
         }}
         .stat-card:hover {{
-            transform: translateY(-3px);
-            box-shadow: 0 8px 28px rgba(30,90,80,0.12);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 28px rgba(0,63,50,0.11);
         }}
         .stat-value {{
             font-size: 30px !important;
             font-weight: 800 !important;
-            letter-spacing: -0.02em;
+            letter-spacing: 0;
         }}
         .handoff-card {{
             border-left: 4px solid {colors["primary"]} !important;
-            box-shadow: 0 2px 14px rgba(30,90,80,0.07) !important;
+            box-shadow: 0 2px 14px rgba(0,63,50,0.07) !important;
         }}
         .handoff-card h3 {{
             font-size: 19px !important;
@@ -1334,7 +1453,7 @@ def inject_night_refinement(colors):
             font-weight: 700 !important;
         }}
         .insight-note {{
-            box-shadow: 0 2px 10px rgba(30,90,80,0.08);
+            box-shadow: 0 2px 10px rgba(0,63,50,0.08);
         }}
         /* Make the iframe that holds carousel flush/borderless */
         iframe[title="streamlit_components_v1_html"] {{
@@ -1347,82 +1466,45 @@ def inject_night_refinement(colors):
     )
 
 
-def overview_tab(meta_df: pd.DataFrame):
-    df_all = meta_df.reset_index()
-    render_hero()
+def render_page_header(title: str, description: str, chips: list[str] | None = None):
+    chip_html = ""
+    if chips:
+        chip_html = '<div class="page-chip-row">' + "".join(
+            f'<span class="disease-chip">{html.escape(str(chip))}</span>' for chip in chips
+        ) + "</div>"
     st.markdown(
-        """
-        <div class="section-header">
-            <h2>临床审查工作台</h2>
-            <p>本系统以临床医生的审查节奏为核心：了解患者背景、检视图像、将模型输出作为第二意见参考，最后记录人工审查结论。</p>
-        </div>
-        <div class="handoff-card">
-            <h3>晨间交班场景</h3>
-            <p>医生打开任务队列，选择患者，查看双眼眼底图像，扫描疾病风险条，核验注意力热图，并留下简短的临床备注。模型辅助工作流程，而非替代临床判断。</p>
+        f"""
+        <div class="page-header">
+          <div>
+            <h2>{html.escape(title)}</h2>
+            <p>{html.escape(description)}</p>
+          </div>
+          {chip_html}
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.markdown(
-        """
-        <div class="feature-grid">
-            <div class="feature-card"><h3>以图像为起点</h3><p>界面将左眼、右眼、合并及增强视图与风险面板紧邻排列，便于在信任数字之前进行目视核验。</p></div>
-            <div class="feature-card"><h3>将风险作为提示</h3><p>预测结果以便于扫描的风险条形式呈现，并按行高亮，仅作为审查线索，非最终诊断结论。</p></div>
-            <div class="feature-card"><h3>形成闭环</h3><p>反馈记录正误情况、审查者信心、备注及标记，使模型错误转化为可追踪的改进病例。</p></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        """
-        <div class="section-header">
-            <h2>诊断流程</h2>
-            <p>每个步骤刻意保持简洁，目标是降低认知切换负担，而非使界面更加复杂。</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    active_patient = st.session_state.get("active_patient_id")
-    if active_patient:
-        st.success(f"当前审查对象：患者 {active_patient}。知识图谱将高亮该病例的预测阳性标签。")
-    st.markdown(
-        """
-        <div class="pipeline">
-            <div class="pipeline-step"><strong>1. 配对图像</strong><span>加载左右眼眼底照片。</span></div>
-            <div class="pipeline-step"><strong>2. 合并视图</strong><span>标准化尺寸，生成双眼诊断画布。</span></div>
-            <div class="pipeline-step"><strong>3. 推断标签</strong><span>运行疾病特异性 ConvNeXt 二元分类器。</span></div>
-            <div class="pipeline-step"><strong>4. 解释焦点</strong><span>生成 ScoreCAM 注意力热图以供目视核查。</span></div>
-            <div class="pipeline-step"><strong>5. 审查病例</strong><span>保存医生对错误或不确定预测的反馈。</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    col_cases, col_labels, col_models = st.columns(3)
-    with col_cases:
-        st.markdown(f'<div class="stat-card"><div class="stat-label">数据集病例</div><div class="stat-value">{len(df_all)}</div><div class="metric-hint">从标签元数据加载的行数。</div></div>', unsafe_allow_html=True)
-    with col_labels:
-        st.markdown(f'<div class="stat-card"><div class="stat-label">疾病标签</div><div class="stat-value">{len(LABELS)}</div><div class="metric-hint">ODIR 筛查分类数量。</div></div>', unsafe_allow_html=True)
-    with col_models:
-        model_count = len(list(MODELS_DIR.glob("best_*_fold5.pth")))
-        st.markdown(f'<div class="stat-card"><div class="stat-label">已加载检查点</div><div class="stat-value">{model_count}</div><div class="metric-hint">可用的 Fold-5 模型文件数。</div></div>', unsafe_allow_html=True)
 
 
 def knowledge_tab():
-    st.markdown(
-        """
-        <div class="section-header">
-            <h2>眼科疾病知识图谱</h2>
-            <p>作为临床参考：风险因素、症状、检查项及 ODIR 标签集中呈现，便于审查者分析某条诊断路径被激活的原因。</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
     active_predictions = st.session_state.get("active_predictions", {})
     active_labels = {label for label, value in active_predictions.items() if value == 1}
-    selected_label = st.selectbox("疾病详情面板", LABELS, format_func=lambda label: f"{label} - {DISEASE_NAMES[label]}")
-    render_obsidian_graph(active_labels=active_labels, selected_label=selected_label)
+    chips = ["图谱联动"]
+    if active_labels:
+        chips.append(f"当前阳性 {len(active_labels)} 项")
+    render_page_header(
+        "知识图谱",
+        "将模型预测标签与风险因素、症状和检查项目联动，帮助解释诊断关注点。",
+        chips,
+    )
+    st.markdown('<div class="filter-panel">', unsafe_allow_html=True)
+    graph_col, disease_col = st.columns([1.25, 1])
+    with graph_col:
+        graph_search = st.text_input("图谱搜索", placeholder="输入疾病、症状、风险因素或检查项，例如：青光眼、飞蚊、OCT")
+    with disease_col:
+        selected_label = st.selectbox("疾病详情面板", LABELS, format_func=lambda label: f"{label} - {DISEASE_NAMES[label]}")
+    st.markdown("</div>", unsafe_allow_html=True)
+    render_obsidian_graph(active_labels=active_labels, selected_label=selected_label, search_query=graph_search)
 
     detail = DISEASE_DETAILS[selected_label]
     st.markdown(
@@ -1438,38 +1520,18 @@ def knowledge_tab():
         """,
         unsafe_allow_html=True,
     )
-    if active_labels:
-        active_text = ", ".join([f"{label} - {DISEASE_NAMES[label]}" for label in sorted(active_labels)])
-        st.info(f"当前患者图谱叠加层：{active_text}")
 
-    st.markdown("### 疾病速查")
-    st.markdown(
-        """
-        <div class="feature-grid">
-            <div class="knowledge-card"><h3>糖尿病视网膜病变</h3><p>关注微动脉瘤、出血灶、硬性渗出、黄斑水肿及新生血管改变。</p></div>
-            <div class="knowledge-card"><h3>青光眼</h3><p>典型线索包括视盘凹陷扩大、视网膜神经纤维层变薄、眼压升高及视野缺损。</p></div>
-            <div class="knowledge-card"><h3>白内障</h3><p>晶状体混浊可降低图像清晰度，引起进行性视力模糊、眩光及对比度下降。</p></div>
-            <div class="knowledge-card"><h3>AMD（年龄相关性黄斑变性）</h3><p>黄斑玻璃膜疣、色素改变、地图样萎缩或新生血管改变可影响中心视力。</p></div>
-            <div class="knowledge-card"><h3>高血压视网膜病变</h3><p>小动脉变细、动静脉交叉压迹、出血、棉绒斑及视盘水肿可提示病变严重程度。</p></div>
-            <div class="knowledge-card"><h3>病理性近视</h3><p>可见豹纹状眼底、后巩膜葡萄肿、漆裂纹、萎缩或近视性脉络膜新生血管。</p></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("### 筛查标签")
-    chips = "".join([f'<span class="disease-chip">{label} - {DISEASE_NAMES[label]}</span>' for label in LABELS])
-    st.markdown(chips, unsafe_allow_html=True)
+    return
 
 
 def risk_level(probability: float, positive: bool) -> tuple[str, str]:
     if positive:
-        return "Positive", "high"
+        return "阳性提示", "high"
     if probability >= 0.7:
-        return "Suppressed", "medium"
+        return "需复核", "medium"
     if probability >= 0.3:
-        return "Review", "medium"
-    return "Low", "low"
+        return "观察", "medium"
+    return "低风险", "low"
 
 
 def assess_image_quality(image: Image.Image):
@@ -1492,44 +1554,32 @@ def assess_image_quality(image: Image.Image):
 
     checks = [
         {
-            "name": "Brightness",
+            "name": "亮度",
             "status": "fail" if brightness < 35 else "warn" if brightness < 55 else "ok",
             "value": f"{brightness:.0f}/255",
-            "note": "Image is very dark" if brightness < 35 else "Slightly dark" if brightness < 55 else "Acceptable",
+            "note": "图像过暗" if brightness < 35 else "略暗，建议复核" if brightness < 55 else "可接受",
         },
         {
-            "name": "Contrast",
+            "name": "对比度",
             "status": "warn" if contrast < 28 else "ok",
             "value": f"{contrast:.0f}",
-            "note": "Low contrast may hide lesions" if contrast < 28 else "Acceptable",
+            "note": "对比度偏低，可能影响病灶观察" if contrast < 28 else "可接受",
         },
         {
-            "name": "Resolution",
+            "name": "分辨率",
             "status": "warn" if min(width, height) < 512 else "ok",
             "value": f"{width} x {height}",
-            "note": "Below model target size" if min(width, height) < 512 else "Acceptable",
+            "note": "低于模型目标尺寸" if min(width, height) < 512 else "可接受",
         },
         {
-            "name": "Black border",
+            "name": "黑边",
             "status": "warn" if dark_border_ratio > 0.65 else "ok",
             "value": f"{dark_border_ratio:.0%}",
-            "note": "Large dark border detected" if dark_border_ratio > 0.65 else "Acceptable",
+            "note": "检测到较大黑边" if dark_border_ratio > 0.65 else "可接受",
         },
     ]
     overall = "fail" if any(item["status"] == "fail" for item in checks) else "warn" if any(item["status"] == "warn" for item in checks) else "ok"
     return {"overall": overall, "checks": checks}
-
-
-def render_quality_panel(quality):
-    label = {"ok": "Acceptable", "warn": "Review image quality", "fail": "Poor image quality"}[quality["overall"]]
-    st.markdown(f"#### Image Quality Check: {label}")
-    items = []
-    for item in quality["checks"]:
-        css = "" if item["status"] == "ok" else item["status"]
-        items.append(
-            f'<div class="quality-item {css}"><strong>{item["name"]}</strong><span>{item["value"]} - {item["note"]}</span></div>'
-        )
-    st.markdown(f'<div class="quality-grid">{"".join(items)}</div>', unsafe_allow_html=True)
 
 
 def render_comorbidity_alert(result_df: pd.DataFrame):
@@ -1540,18 +1590,18 @@ def render_comorbidity_alert(result_df: pd.DataFrame):
     disease_text = ", ".join([f"{row.Label} - {row.Disease}" for row in positives.itertuples()])
     suggestions = []
     if {"D", "H"}.issubset(labels):
-        suggestions.append("review systemic vascular risk, blood pressure, and diabetes control together")
+        suggestions.append("结合血压、血糖和全身血管风险一起复核")
     if {"D", "A"}.issubset(labels) or {"D", "M"}.issubset(labels):
-        suggestions.append("consider macular OCT because central retinal complications may overlap")
+        suggestions.append("建议关注黄斑 OCT，因为中央视网膜并发改变可能重叠")
     if {"G", "M"}.issubset(labels):
-        suggestions.append("interpret optic disc findings carefully because high myopia can mimic glaucoma cues")
+        suggestions.append("高度近视可能影响视盘判断，青光眼线索需谨慎解释")
     if not suggestions:
-        suggestions.append("prioritize clinician review because multiple disease labels are active")
+        suggestions.append("多个疾病标签同时激活，建议优先人工复核")
     st.markdown(
         f"""
         <div class="insight-note">
-            <strong>Multi-label review cue</strong><br>
-            Active labels: {disease_text}. Suggested review: {"; ".join(suggestions)}.
+            <strong>多标签复核提示</strong><br>
+            当前阳性标签：{disease_text}。建议复核：{"；".join(suggestions)}。
         </div>
         """,
         unsafe_allow_html=True,
@@ -1577,74 +1627,14 @@ def render_risk_panel(result_df: pd.DataFrame):
     st.markdown("".join(rows), unsafe_allow_html=True)
 
 
-def build_diagnosis_report(patient_key, age, sex, result_df: pd.DataFrame) -> str:
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    sorted_df = result_df.sort_values("Probability", ascending=False).reset_index(drop=True)
-    positives = result_df[result_df["Prediction"] == 1].sort_values("Probability", ascending=False)
-    top = sorted_df.iloc[0]
-    flagged = ", ".join([f"{row.Label} - {row.Disease} ({row.Probability:.2f})" for row in positives.itertuples()])
-    if not flagged:
-        flagged = "No positive disease label"
-    action_label = positives.iloc[0]["Label"] if len(positives) else "N"
-    lines = [
-        "# RetinaScope Clinical Review Report",
-        "",
-        f"Generated: {timestamp}",
-        f"Patient ID: {patient_key}",
-        f"Age: {age if age is not None else 'Unknown'}",
-        f"Sex: {sex if sex is not None else 'Unknown'}",
-        "",
-        "## Summary",
-        f"- Highest raw model score: {top['Label']} - {top['Disease']} ({top['Probability']:.2f})",
-        f"- Final positive label: {flagged}",
-        f"- Suggested next check: {DISEASE_ACTIONS[action_label]}",
-        "",
-        "## Model Results",
-        "| Label | Disease | Probability | Risk level | Prediction |",
-        "|---|---|---:|---|---:|",
-    ]
-    for row in result_df.itertuples():
-        level, _ = risk_level(float(row.Probability), int(row.Prediction) == 1)
-        lines.append(f"| {row.Label} | {row.Disease} | {row.Probability:.2f} | {level} | {int(row.Prediction)} |")
-    lines.extend(
-        [
-            "",
-            "## Clinical Notes",
-            "- This report is generated by an AI-assisted screening tool and should be reviewed by a qualified clinician.",
-            "- Prioritize urgent care if symptoms include sudden vision loss, severe pain, trauma, flashes, floaters, or rapidly worsening vision.",
-            "- Check image quality and clinical history before acting on a model prediction.",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def render_report_panel(report_text: str, patient_key: str):
-    st.markdown(
-        """
-        <div class="handoff-card">
-            <h3>Generated clinical report</h3>
-            <p>A structured Markdown report has been prepared from the model output. Review it before sharing or storing it in a clinical record.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.download_button(
-        "Download report as Markdown",
-        data=report_text,
-        file_name=f"retinascope_report_{patient_key}_{time.strftime('%Y%m%d_%H%M%S')}.md",
-        mime="text/markdown",
-    )
-    with st.expander("Preview report"):
-        st.markdown(report_text)
-
-
-def render_obsidian_graph(active_labels=None, selected_label=None):
+def render_obsidian_graph(active_labels=None, selected_label=None, search_query=""):
     active_labels = sorted(active_labels or [])
     payload = {
         "nodes": GRAPH_NODES,
         "edges": [{"source": source, "target": target} for source, target in GRAPH_EDGES],
         "activeLabels": active_labels,
         "selectedLabel": selected_label or "",
+        "searchQuery": search_query or "",
         "details": DISEASE_DETAILS,
         "names": DISEASE_NAMES,
     }
@@ -1676,14 +1666,14 @@ def render_obsidian_graph(active_labels=None, selected_label=None):
       </div>
     </div>
     <style>
-      #retina-graph-wrap {{ background: #f8f7f5; border-radius: 14px; padding: 18px; border: 1px solid #e7e2dc; }}
-      .graph-shell {{ position: relative; background: #fffdfb; border: 1px solid #e6e0d9; border-radius: 12px; overflow: hidden; box-shadow: 0 14px 36px rgba(122, 94, 53, 0.10); }}
-      .graph-topbar {{ height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-bottom: 1px solid #eee8e1; color: #35504d; font-family: Inter, Segoe UI, sans-serif; }}
+      #retina-graph-wrap {{ background: #f4faf7; border-radius: 14px; padding: 18px; border: 1px solid #dbe7e2; }}
+      .graph-shell {{ position: relative; background: #ffffff; border: 1px solid #dbe7e2; border-radius: 12px; overflow: hidden; box-shadow: 0 14px 36px rgba(0, 63, 50, 0.08); }}
+      .graph-topbar {{ height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-bottom: 1px solid #e7efeb; color: #102a27; font-family: Inter, Segoe UI, sans-serif; }}
       .graph-topbar strong {{ display: block; font-size: 14px; }}
       .graph-topbar span {{ color: #8a8178; font-size: 12px; }}
       .graph-actions {{ display: flex; gap: 8px; }}
-      .graph-actions button {{ border: 1px solid #d8d1c8; background: #fffdf9; color: #5f736f; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; }}
-      .graph-actions button:hover {{ background: #f3f0ec; }}
+      .graph-actions button {{ border: 1px solid #dbe7e2; background: #ffffff; color: #006b4e; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; }}
+      .graph-actions button:hover {{ background: #eef7f2; }}
       .graph-legend {{ display: flex; gap: 12px; align-items: center; }}
       .graph-legend span {{ display: flex; gap: 5px; align-items: center; }}
       .graph-legend i {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
@@ -1691,8 +1681,8 @@ def render_obsidian_graph(active_labels=None, selected_label=None):
       .graph-legend .disease {{ background: #8fbf89; }}
       .graph-legend .risk {{ background: #d5ad55; }}
       .graph-legend .test {{ background: #94aaa1; }}
-      #retina-graph {{ width: 100%; height: 620px; display: block; background: radial-gradient(circle at 50% 45%, #ffffff, #fbfaf8); }}
-      .graph-detail {{ position: absolute; right: 14px; bottom: 14px; width: 270px; max-height: 210px; overflow: auto; padding: 12px; border-radius: 10px; background: rgba(255,253,249,0.92); border: 1px solid #e6e0d9; color: #35504d; font-family: Inter, Segoe UI, sans-serif; box-shadow: 0 10px 26px rgba(122, 94, 53, 0.10); }}
+      #retina-graph {{ width: 100%; height: 620px; display: block; background: radial-gradient(circle at 50% 45%, #ffffff, #f7fbf9); }}
+      .graph-detail {{ position: absolute; right: 14px; bottom: 14px; width: 270px; max-height: 210px; overflow: auto; padding: 12px; border-radius: 10px; background: rgba(255,255,255,0.94); border: 1px solid #dbe7e2; color: #102a27; font-family: Inter, Segoe UI, sans-serif; box-shadow: 0 10px 26px rgba(0, 63, 50, 0.10); }}
       .graph-detail strong {{ font-size: 14px; }}
       .graph-detail p {{ margin: 6px 0 0; font-size: 12px; line-height: 1.45; color: #6f7d79; }}
       .node-label {{ user-select: none; pointer-events: none; }}
@@ -1706,6 +1696,7 @@ def render_obsidian_graph(active_labels=None, selected_label=None):
       const ns = "http://www.w3.org/2000/svg";
       const active = new Set(payload.activeLabels || []);
       const selected = payload.selectedLabel;
+      const searchQuery = (payload.searchQuery || "").trim().toLowerCase();
       const CX = 540, CY = 330, INIT_R = 210;
       const nodes = payload.nodes.map((n, i) => {{
         const angle = (i / payload.nodes.length) * Math.PI * 2 - Math.PI / 2;
@@ -1729,7 +1720,12 @@ def render_obsidian_graph(active_labels=None, selected_label=None):
       let panning = null;
       let pointerMoved = false;
 
-      function matchNode(n) {{ return true; }}
+      function matchNode(n) {{
+        if (!searchQuery) return true;
+        const detail = n.label_code && payload.details[n.label_code] ? payload.details[n.label_code] : {{}};
+        const haystack = [n.id, n.label, n.kind, n.label_code || "", detail.title || "", detail.symptoms || "", detail.risk || "", detail.fundus || "", detail.tests || ""].join(" ").toLowerCase();
+        return haystack.includes(searchQuery);
+      }}
       function make(tag, attrs={{}}) {{
         const el = document.createElementNS(ns, tag);
         Object.entries(attrs).forEach(([k,v]) => el.setAttribute(k,v));
@@ -1746,7 +1742,7 @@ def render_obsidian_graph(active_labels=None, selected_label=None):
       const nodeElements = new Map();
 
       payload.edges.forEach(e => {{
-        const line = make("line", {{"data-source":e.source, "data-target":e.target, stroke:"#d8d1c8", "stroke-width":"1", opacity:"0.55"}});
+        const line = make("line", {{"data-source":e.source, "data-target":e.target, stroke:"#cddbd5", "stroke-width":"1", opacity:"0.55"}});
         edgeLayer.appendChild(line);
         edgeElements.push({{...e, el: line}});
       }});
@@ -1754,10 +1750,10 @@ def render_obsidian_graph(active_labels=None, selected_label=None):
         const isActive = n.label_code && active.has(n.label_code);
         const isSelected = n.label_code && n.label_code === selected;
         const isMatch = matchNode(n);
-        const group = make("g", {{"data-id":n.id, opacity: isMatch ? "1" : "0.16", style:"cursor:grab"}});
-        const halo = make("circle", {{r:n.r + (isActive || isSelected ? 9 : 4), fill:isActive ? "#eef6f2" : "#f1eee6", opacity:isActive || isSelected ? "0.82" : "0.34"}});
-        const circle = make("circle", {{r:n.r, fill:isSelected ? "#4f9b8f" : isActive ? "#7aa874" : colors[n.kind] || "#94aaa1", stroke:"#fffdf9", "stroke-width": isActive || isSelected ? "2.4" : "1.2"}});
-        const label = make("text", {{x:n.r + 5, y:4, fill:"#5f736f", "font-size": n.kind === "core" ? "12" : "9", "font-family":"Inter, Segoe UI, sans-serif", class:"node-label"}});
+        const group = make("g", {{"data-id":n.id, opacity: isMatch ? "1" : "0.62", style:"cursor:grab"}});
+        const halo = make("circle", {{r:n.r + (isActive || isSelected || isMatch && searchQuery ? 9 : 4), fill:isActive ? "#eef6f2" : searchQuery && isMatch ? "#e6f7ef" : "#eef4f1", opacity:isActive || isSelected || searchQuery && isMatch ? "0.88" : "0.42"}});
+        const circle = make("circle", {{r:n.r, fill:isSelected ? "#006b4e" : isActive ? "#16815f" : searchQuery && isMatch ? "#006b4e" : colors[n.kind] || "#94aaa1", stroke:"#ffffff", "stroke-width": isActive || isSelected || searchQuery && isMatch ? "2.6" : "1.2"}});
+        const label = make("text", {{x:n.r + 5, y:4, fill: searchQuery && isMatch ? "#102a27" : "#5f736f", "font-size": n.kind === "core" ? "12" : "9", "font-family":"Inter, Segoe UI, sans-serif", class:"node-label"}});
         label.textContent = n.label;
         group.appendChild(halo); group.appendChild(circle); group.appendChild(label);
         group.addEventListener("pointerdown", (event) => {{
@@ -1818,19 +1814,22 @@ def render_obsidian_graph(active_labels=None, selected_label=None):
           const related = selectedNodeId && (e.source === selectedNodeId || e.target === selectedNodeId);
           e.el.setAttribute("x1", a.x); e.el.setAttribute("y1", a.y);
           e.el.setAttribute("x2", b.x); e.el.setAttribute("y2", b.y);
-          e.el.setAttribute("stroke", related ? "#4f9b8f" : "#d8d1c8");
-          e.el.setAttribute("stroke-width", related ? "2" : "1");
-          e.el.setAttribute("opacity", selectedNodeId ? (related ? "0.95" : "0.18") : "0.55");
+          const searchRelated = searchQuery && (matchNode(a) || matchNode(b));
+          e.el.setAttribute("stroke", related || searchRelated ? "#006b4e" : "#cddbd5");
+          e.el.setAttribute("stroke-width", related || searchRelated ? "2" : "1");
+          e.el.setAttribute("opacity", selectedNodeId ? (related ? "0.95" : "0.30") : (searchRelated ? "0.75" : "0.48"));
         }});
         nodes.forEach(n => {{
           const entry = nodeElements.get(n.id);
           const isNeighbor = selectedNodeId && neighborMap.get(selectedNodeId)?.has(n.id);
           const isSelectedNode = selectedNodeId === n.id;
+          const isMatch = matchNode(n);
+          const searchNeighbor = searchQuery && nodes.some(m => matchNode(m) && neighborMap.get(m.id)?.has(n.id));
           const isDimmed = selectedNodeId && !(isNeighbor || isSelectedNode);
           entry.group.setAttribute("transform", `translate(${{n.x}} ${{n.y}})`);
-          entry.group.setAttribute("opacity", isDimmed ? "0.22" : (matchNode(n) ? "1" : "0.16"));
-          entry.circle.setAttribute("stroke-width", isSelectedNode ? "3.2" : (isNeighbor ? "2.2" : entry.circle.getAttribute("stroke-width")));
-          entry.halo.setAttribute("opacity", isSelectedNode || isNeighbor ? "0.72" : entry.halo.getAttribute("opacity"));
+          entry.group.setAttribute("opacity", isDimmed ? "0.34" : (isMatch ? "1" : (searchNeighbor ? "0.78" : "0.54")));
+          entry.circle.setAttribute("stroke-width", isSelectedNode || isMatch ? "3.2" : (isNeighbor || searchNeighbor ? "2.2" : "1.2"));
+          entry.halo.setAttribute("opacity", isSelectedNode || isNeighbor || isMatch ? "0.82" : "0.38");
         }});
       }}
       function centerOn(n) {{
@@ -1918,7 +1917,13 @@ def render_obsidian_graph(active_labels=None, selected_label=None):
         reheat(1.0); render();
       }});
       settleBtn.addEventListener("click", () => reheat(0.8));
-      if (selected) {{
+      if (searchQuery) {{
+        const firstMatch = nodes.find(matchNode);
+        if (firstMatch) {{
+          selectNode(firstMatch);
+          centerOn(firstMatch);
+        }}
+      }} else if (selected) {{
         const selectedNode = nodes.find(n => n.label_code === selected);
         if (selectedNode) selectNode(selectedNode);
       }}
@@ -1940,19 +1945,19 @@ def render_review_summary(result_df: pd.DataFrame):
     else:
         action_label = "N"
         action = DISEASE_ACTIONS["N"]
-        positive_text = "No positive disease label"
+        positive_text = "无阳性疾病标签"
     suppressed = result_df[(result_df["Prediction"] == 0) & (result_df["Probability"] >= 0.7)]
     suppressed_text = ""
     if len(suppressed):
-        suppressed_text = " Suppressed high scores: " + ", ".join(
+        suppressed_text = "需复核的高分阴性项：" + ", ".join(
             [f"{row.Label} ({row.Probability:.2f})" for row in suppressed.itertuples()]
         )
     st.markdown(
         f"""
         <div class="review-summary">
-            <div class="review-cell"><span>Highest model signal</span><strong>{top["Label"]} - {top["Disease"]} ({top["Probability"]:.2f})</strong></div>
-            <div class="review-cell"><span>Final positive label</span><strong>{positive_text}</strong></div>
-            <div class="review-cell"><span>Suggested next check</span><strong>{action}</strong></div>
+            <div class="review-cell"><span>最高模型信号</span><strong>{top["Label"]} - {top["Disease"]} ({top["Probability"]:.2f})</strong></div>
+            <div class="review-cell"><span>阳性标签</span><strong>{positive_text}</strong></div>
+            <div class="review-cell"><span>建议复核重点</span><strong>{action}</strong></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1969,204 +1974,41 @@ def render_chat_message(message, user_avatar_b64, ai_avatar_b64):
         st.markdown(message["content"])
 
 
-def diagnosis_tab(meta_df: pd.DataFrame, colors):
-    st.sidebar.markdown("### 推理设置")
-    cuda_available = torch.cuda.is_available()
-    gpu_requested = st.sidebar.checkbox("使用 GPU", value=cuda_available, disabled=not cuda_available)
-    if not cuda_available:
-        st.sidebar.caption("此 Python 环境中 CUDA 不可用，推理将在 CPU 上运行。")
-    device = "cuda" if gpu_requested and cuda_available else "cpu"
-    st.sidebar.markdown("---")
-    st.title("眼底诊断")
-    st.sidebar.markdown("### 图像输入")
-    upload_opt = st.sidebar.radio("来源", ["上传图像", "使用训练图像目录"])
-
-    images = []
-    if upload_opt == "上传图像":
-        files = st.sidebar.file_uploader("选择一张或多张眼底图像", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
-        for file in files or []:
-            images.append((file.name, Image.open(file).convert("RGB")))
-    else:
-        available_ids = sorted({int(p.name.split("_")[0]) for p in TRAIN_IMAGES_DIR.glob("*_left.jpg")})
-        patient_ids = st.sidebar.multiselect("选择患者编号", available_ids)
-        for pid in patient_ids:
-            left_path = TRAIN_IMAGES_DIR / f"{pid}_left.jpg"
-            right_path = TRAIN_IMAGES_DIR / f"{pid}_right.jpg"
-            if left_path.exists() and right_path.exists():
-                images.append((pid, image_merge(left_path, right_path)))
-            else:
-                st.sidebar.warning(f"患者 {pid} 缺少左眼或右眼图像。")
-
-    if not images:
-        st.info("请在侧栏选择或上传图像以开始诊断。")
-        return
-
-    for name, merged_img in images:
-        patient_key = str(name).split("_")[0]
-        has_patient_id = patient_key.isdigit() and int(patient_key) in meta_df.index
-        age, sex = None, None
-        if has_patient_id:
-            age = meta_df.loc[int(patient_key), "Patient Age"]
-            sex = meta_df.loc[int(patient_key), "Patient Sex"]
-            st.markdown(
-                f'<div class="section-header"><h2>患者 {patient_key}</h2>'
-                f'<p>年龄：{age} 岁 &nbsp;|&nbsp; 性别：{sex}</p></div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f'<div class="section-header"><h2>上传图像</h2><p>{name}</p></div>',
-                unsafe_allow_html=True,
-            )
-
-        left_path = TRAIN_IMAGES_DIR / f"{patient_key}_left.jpg"
-        right_path = TRAIN_IMAGES_DIR / f"{patient_key}_right.jpg"
-
-        with st.spinner("正在运行模型推理，请稍候..."):
-            probs, preds, cams, cam_errors = predict(merged_img, MODELS_DIR, device=device)
-
-        result_df = pd.DataFrame(
-            {
-                "Label": LABELS,
-                "Disease": [DISEASE_NAMES[label] for label in LABELS],
-                "Probability": np.round(probs, 2),
-                "Prediction": preds,
-            }
-        )
-
-        # ── Section 1：图像审查 ──────────────────────────────────────────
-        st.markdown("#### 图像审查")
-        img_left_col, img_right_col, img_merged_col = st.columns([1, 1, 2.2], gap="medium")
-        with img_left_col:
-            if left_path.exists():
-                render_diagnostic_image(Image.open(left_path), caption="左眼", max_width=260, max_height=260)
-            else:
-                st.caption("左眼图像不存在")
-        with img_right_col:
-            if right_path.exists():
-                render_diagnostic_image(Image.open(right_path), caption="右眼", max_width=260, max_height=260)
-            else:
-                st.caption("右眼图像不存在")
-        with img_merged_col:
-            render_diagnostic_image(merged_img, caption="双眼拼接图像", max_width=560, max_height=280)
-        render_quality_panel(assess_image_quality(merged_img))
-
-        st.divider()
-
-        # ── Section 2：AI 分析 ───────────────────────────────────────────
-        st.markdown("#### AI 分析结果")
-        result_col, cam_col = st.columns([1.12, 0.88], gap="large")
-
-        with result_col:
-            render_review_summary(result_df)
-            render_risk_panel(result_df)
-            render_comorbidity_alert(result_df)
-            if has_patient_id:
-                truth = meta_df.loc[int(patient_key), LABELS].astype(int)
-                truth_labels = [f"{label} - {DISEASE_NAMES[label]}" for label in LABELS if int(truth[label]) == 1]
-                with st.expander("数据集参考标签"):
-                    st.caption("来自 CSV 元数据，仅供对比，不参与模型预测。")
-                    st.write(", ".join(truth_labels) if truth_labels else "无标签记录。")
-            with st.expander("详细概率数据表"):
-                render_warm_table(result_df)
-            st.markdown(
-                '<div class="quiet-note">模型输出仅供审查参考。若图像质量、症状或临床病史与结果相悖，应优先遵循临床判断。</div>',
-                unsafe_allow_html=True,
-            )
-
-        with cam_col:
-            st.markdown("##### 模型注意力热图（GradCAM++）")
-            if cams:
-                default_idx = int(np.argmax(probs))
-                selected_cam_label = st.selectbox(
-                    "选择关注的疾病标签",
-                    LABELS,
-                    index=default_idx,
-                    format_func=lambda lbl: f"{lbl} — {DISEASE_NAMES[lbl]}",
-                    key=f"cam_label_{name}",
-                )
-                cam_index = LABELS.index(selected_cam_label)
-                if cam_index < len(cams):
-                    cam_img = cams[cam_index]
-                    render_cam_image(cam_img, caption=f"GradCAM++ · {DISEASE_NAMES[selected_cam_label]}", max_width=460, max_height=320)
-                    if selected_cam_label in cam_errors:
-                        st.caption(f"注意力图生成失败，显示原始图像。错误：{cam_errors[selected_cam_label]}")
-                    else:
-                        prob_val = float(probs[cam_index])
-                        st.caption(f"该标签预测概率：{prob_val:.1%}")
-            else:
-                st.info("未生成注意力图。")
-
-        st.divider()
-
-        # ── Section 3：临床文档 ───────────────────────────────────────────
-        st.markdown("#### 临床文档")
-        st.session_state["active_patient_id"] = str(patient_key)
-        st.session_state["active_predictions"] = {label: int(pred) for label, pred in zip(LABELS, preds)}
-        report_text = build_diagnosis_report(patient_key, age, sex, result_df)
-        report_saved_key = f"report_saved_{patient_key}_{hash(report_text)}"
-        if report_saved_key not in st.session_state:
-            st.session_state[report_saved_key] = save_diagnosis_report(patient_key, age, sex, probs, preds, report_text)
-
-        report_col, feedback_col = st.columns([1, 1], gap="large")
-        with report_col:
-            render_report_panel(report_text, patient_key)
-            st.caption(f"报告 ID：{st.session_state[report_saved_key]}")
-
-        with feedback_col:
-            st.markdown("##### 医生审查反馈")
-            with st.form(key=f"feedback_{name}", clear_on_submit=False):
-                doctor_ok = st.radio("临床审查结果", ["正确", "不正确"], horizontal=True, key=f"radio_{name}")
-                confidence = st.slider("审查者信心", min_value=1, max_value=5, value=4, key=f"confidence_{name}")
-                flag_for_review = st.checkbox("标记此病例待复查", key=f"flag_{name}")
-                feedback_comment = st.text_area(
-                    "临床备注",
-                    placeholder="不一致原因、图像质量问题、疑似标签、随访安排等。",
-                    key=f"comment_{name}",
-                )
-                submitted = st.form_submit_button("提交反馈", type="primary")
-                if submitted:
-                    save_feedback(name, probs, preds, doctor_ok == "正确", confidence=confidence, comment=feedback_comment, flag_for_review=flag_for_review)
-                    st.session_state[f"feedback_saved_{name}"] = True
-            if st.session_state.get(f"feedback_saved_{name}", False):
-                st.success("反馈已保存。")
-
-        st.divider()
-
-
-def errors_tab():
-    st.header("医生标记为错误的病例")
-    error_files = sorted(FEEDBACK_DIR.glob("*.json"))
-    if not error_files:
-        st.info("暂无被标记为错误的病例。")
-        return
-
+def load_feedback_review_records():
     records = []
-    for file_path in error_files:
-        try:
-            data = json.loads(file_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            st.warning(f"Could not read {file_path.name}: {exc}")
-            continue
-        if data.get("correct"):
+    source_records = load_local_feedback()
+
+    for data in source_records:
+        if data.get("correct") and not data.get("flag_for_review", False):
             continue
         probs = data.get("probs", [0] * len(LABELS))
         preds = data.get("preds", [0] * len(LABELS))
         records.append(
             {
                 "data": data,
-                "pid": str(data["img_id"]),
+                "pid": str(data.get("img_id") or data.get("patient_id") or ""),
                 "max_prob": max(probs) if probs else 0,
                 "positive_labels": [label for label, pred in zip(LABELS, preds) if int(pred) == 1],
                 "flag_for_review": bool(data.get("flag_for_review", False)),
                 "confidence": data.get("confidence"),
             }
         )
+    return records, "file"
 
+
+def errors_tab():
+    records, feedback_source = load_feedback_review_records()
+    source_label = "本地反馈文件" if feedback_source == "file" else feedback_source
+    render_page_header(
+        "错误病例与复查队列",
+        "集中查看被标记为不正确或待复查的病例，便于后续复盘模型表现和人工标注质量。",
+        [f"来源：{source_label}", f"记录 {len(records)} 条"],
+    )
     if not records:
-        st.info("存在反馈数据，但无病例被标记为错误。")
+        st.markdown('<div class="empty-state">暂无被标记为错误或待复查的病例。</div>', unsafe_allow_html=True)
         return
 
+    st.markdown('<div class="filter-panel">', unsafe_allow_html=True)
     filter_cols = st.columns(4)
     with filter_cols[0]:
         label_filter = st.selectbox("疾病筛选", ["All"] + LABELS, format_func=lambda value: "全部标签" if value == "All" else f"{value} - {DISEASE_NAMES[value]}")
@@ -2176,6 +2018,7 @@ def errors_tab():
         min_probability = st.slider("最低概率阈值", 0.0, 1.0, 0.0, 0.05)
     with filter_cols[3]:
         sort_mode = st.selectbox("排序方式", ["按概率从高到低", "患者编号", "审查者信心"])
+    st.markdown("</div>", unsafe_allow_html=True)
 
     filtered = [
         record
@@ -2197,6 +2040,18 @@ def errors_tab():
         pid = record["pid"]
         st.markdown('<div class="error-case-card">', unsafe_allow_html=True)
         st.subheader(f"患者编号：{pid}")
+        reviewer = data.get("doctor_name")
+        created_at = data.get("created_at")
+        st.markdown(
+            f"""
+            <div class="meta-strip">
+              <div class="meta-pill"><b>审查者</b><span>{html.escape(str(reviewer or "未填写"))}</span></div>
+              <div class="meta-pill"><b>标注时间</b><span>{html.escape(str(created_at or "未知"))}</span></div>
+              <div class="meta-pill"><b>病例状态</b><span>{"待复查" if record["flag_for_review"] else "错误标注"}</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         col_left, col_right = st.columns(2)
         with col_left:
             left_path = TRAIN_IMAGES_DIR / f"{pid}_left.jpg"
@@ -2219,197 +2074,103 @@ def errors_tab():
             }
         )
         render_risk_panel(detail_df)
-        meta_cols = st.columns(3)
-        with meta_cols[0]:
-            st.metric("审查者信心", data.get("confidence", "未填写"))
-        with meta_cols[1]:
-            st.metric("标记状态", "已标记" if data.get("flag_for_review") else "否")
-        with meta_cols[2]:
-            st.metric("最高概率", f"{record['max_prob']:.2f}")
+        st.markdown(
+            f"""
+            <div class="meta-strip">
+              <div class="meta-pill"><b>审查者信心</b><span>{html.escape(str(data.get("confidence", "未填写")))}</span></div>
+              <div class="meta-pill"><b>标记状态</b><span>{"已标记" if data.get("flag_for_review") else "否"}</span></div>
+              <div class="meta-pill"><b>最高概率</b><span>{record['max_prob']:.2f}</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         if data.get("comment"):
             st.markdown(f"**临床备注：** {data['comment']}")
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-def stats_tab(meta_df: pd.DataFrame, colors):
-    st.markdown(
-        """
-        <div class="section-header">
-            <h2>数据集概览</h2>
-            <p>这些图表用于质量审查和偏差检验：年龄分布、性别比例、疾病流行率及多标签共现模式。</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    df_all = meta_df.reset_index()
-
-    col_total, col_age, col_male, col_female = st.columns(4)
-    cards = [
-        (col_total, "病例总数", len(df_all)),
-        (col_age, "平均年龄", int(df_all["Patient Age"].mean())),
-        (col_male, "男性病例", len(df_all[df_all["Patient Sex"] == "Male"])),
-        (col_female, "女性病例", len(df_all[df_all["Patient Sex"] == "Female"])),
-    ]
-    for col, label, value in cards:
-        with col:
-            st.markdown(f'<div class="stat-card"><div class="stat-label">{label}</div><div class="stat-value">{value}</div></div>', unsafe_allow_html=True)
-
-    top_left, top_right = st.columns(2)
-    with top_left:
-        st.subheader("年龄分布")
-        ages = df_all["Patient Age"]
-        bin_edges = list(range((ages.min() // 5) * 5, (ages.max() // 5 + 2) * 5, 5))
-        age_counts = pd.cut(ages, bins=bin_edges, right=False).value_counts().sort_index()
-        age_df = pd.DataFrame({"Age range": age_counts.index.map(str), "Cases": age_counts.values})
-        age_chart = (
-            alt.Chart(age_df)
-            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-            .encode(
-                x=alt.X("Age range:N", title="Age range", axis=alt.Axis(labelAngle=-35)),
-                y=alt.Y("Cases:Q", title="Cases"),
-                color=alt.value(colors["secondary"]),
-                tooltip=["Age range", "Cases"],
-            )
-            .properties(width="container", height=300)
-            .configure(background="transparent")
-            .configure_axis(labelColor=colors["muted"], titleColor=colors["text"], gridColor=colors["border"])
-            .configure_view(strokeWidth=0)
-        )
-        st.altair_chart(age_chart, width="stretch")
-
-    with top_right:
-        st.subheader("性别比例")
-        sex_df = df_all["Patient Sex"].value_counts().rename_axis("Sex").reset_index(name="Cases")
-        sex_df["Percent"] = sex_df["Cases"] / sex_df["Cases"].sum()
-        sex_chart = (
-            alt.Chart(sex_df)
-            .mark_arc(innerRadius=58, outerRadius=110)
-            .encode(
-                theta=alt.Theta("Cases:Q"),
-                color=alt.Color("Sex:N", scale=alt.Scale(range=[colors["primary"], colors["secondary"]])),
-                tooltip=["Sex", "Cases", alt.Tooltip("Percent:Q", format=".1%")],
-            )
-            .properties(width="container", height=300)
-            .configure(background="transparent")
-            .configure_legend(labelColor=colors["text"], titleColor=colors["text"])
-            .configure_view(strokeWidth=0)
-        )
-        st.altair_chart(sex_chart, width="stretch")
-
-    mid_left, mid_right = st.columns(2)
-    with mid_left:
-        st.subheader("各性别疾病标签分布")
-        records = []
-        for sex in ["Male", "Female"]:
-            subset = df_all[df_all["Patient Sex"] == sex]
-            for label in LABELS:
-                records.append({"Label": label, "Sex": sex, "Count": int(subset[label].sum())})
-        chart_df = pd.DataFrame(records)
-        chart = (
-            alt.Chart(chart_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("Label:N", title="Disease label"),
-                y=alt.Y("sum(Count):Q", title="Cases"),
-                color=alt.Color("Sex:N", scale=alt.Scale(range=[colors["primary"], colors["secondary"]])),
-                tooltip=["Label", "Sex", "Count"],
-            )
-            .properties(width="container", height=320)
-            .configure(background="transparent")
-            .configure_axis(labelColor=colors["muted"], titleColor=colors["text"], gridColor=colors["border"])
-            .configure_legend(labelColor=colors["text"], titleColor=colors["text"])
-            .configure_view(strokeWidth=0)
-        )
-        st.altair_chart(chart.interactive(), width="stretch")
-
-    with mid_right:
-        st.subheader("疾病标签流行率")
-        label_df = pd.DataFrame(
-            {
-                "Label": LABELS,
-                "Disease": [DISEASE_NAMES[label] for label in LABELS],
-                "Cases": [int(df_all[label].sum()) for label in LABELS],
-            }
-        )
-        label_df["Prevalence"] = label_df["Cases"] / len(df_all)
-        prevalence_chart = (
-            alt.Chart(label_df)
-            .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-            .encode(
-                y=alt.Y("Disease:N", sort="-x", title=None),
-                x=alt.X("Cases:Q", title="Cases"),
-                color=alt.Color("Prevalence:Q", scale=alt.Scale(range=[colors["primary"], colors["secondary"]])),
-                tooltip=["Label", "Disease", "Cases", alt.Tooltip("Prevalence:Q", format=".1%")],
-            )
-            .properties(width="container", height=320)
-            .configure(background="transparent")
-            .configure_axis(labelColor=colors["muted"], titleColor=colors["text"], gridColor=colors["border"])
-            .configure_view(strokeWidth=0)
-        )
-        st.altair_chart(prevalence_chart, width="stretch")
-
-    bottom_left, bottom_right = st.columns(2)
-    with bottom_left:
-        st.subheader("多标签共现热图")
-        co_records = []
-        for left in LABELS:
-            for right in LABELS:
-                co_records.append({"Left": left, "Right": right, "Cases": int(((df_all[left] == 1) & (df_all[right] == 1)).sum())})
-        co_df = pd.DataFrame(co_records)
-        co_chart = (
-            alt.Chart(co_df)
-            .mark_rect()
-            .encode(
-                x=alt.X("Left:N", title=None),
-                y=alt.Y("Right:N", title=None),
-                color=alt.Color("Cases:Q", scale=alt.Scale(range=[colors["accent"], colors["primary"], colors["secondary"]])),
-                tooltip=["Left", "Right", "Cases"],
-            )
-            .properties(width="container", height=320)
-            .configure(background="transparent")
-            .configure_axis(labelColor=colors["text"], titleColor=colors["text"])
-            .configure_view(strokeWidth=0)
-        )
-        st.altair_chart(co_chart, width="stretch")
-
-    with bottom_right:
-        st.subheader("诊断关键词词云")
-        word_cols = st.columns(2)
-        for idx, (title, column) in enumerate([("左眼", "Left-Diagnostic Keywords"), ("右眼", "Right-Diagnostic Keywords")]):
-            text = " ".join(df_all[column].dropna())
-            if not text.strip():
-                continue
-            wc_img = WordCloud(width=340, height=230, background_color="#fffdf9", colormap="BuGn").generate(text)
-            with word_cols[idx]:
-                st.markdown(f"##### {title}")
-                show_image(wc_img.to_array(), width=320)
-
-
-
 def ai_doctor_tab(user_avatar_b64: str, ai_avatar_b64: str):
-    st.markdown('<div class="clinical-card">', unsafe_allow_html=True)
     st.markdown(
         """
-        <div class="section-header">
-            <h2>AI 问诊助手</h2>
-            <p>用于辅助整理分诊备注、检查建议和随访问答，不替代面对面的临床评估。</p>
+        <style>
+          .consult-status {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin: 10px 0 16px;
+          }
+          .consult-status-card {
+            border: 1px solid #dbe7e2;
+            background: #ffffff;
+            padding: 13px 14px;
+            min-height: 74px;
+            border-radius: 8px;
+          }
+          .consult-status-card b {
+            display: block;
+            color: #102a27;
+            font-size: 13px;
+            margin-bottom: 5px;
+          }
+          .consult-status-card span {
+            color: #667874;
+            font-size: 12px;
+            line-height: 1.55;
+          }
+          .consult-section-title {
+            margin: 18px 0 8px;
+            color: #102a27;
+            font-size: 17px;
+            font-weight: 800;
+            letter-spacing: 0;
+          }
+          .consult-note {
+            border-left: 3px solid #006b4e;
+            background: #f4faf7;
+            border-radius: 8px;
+            color: #526663;
+            padding: 10px 12px;
+            font-size: 12px;
+            line-height: 1.6;
+            margin: 10px 0 14px;
+          }
+          @media (max-width: 920px) {
+            .consult-status { grid-template-columns: 1fr; }
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_page_header(
+        "AI 问诊助手",
+        "辅助整理分诊备注、检查建议和随访问答；回答会结合本地眼科知识库与当前诊断上下文。",
+        ["检索依据", "临床辅助", "非最终诊断"],
+    )
+
+    active_predictions = st.session_state.get("active_predictions", {})
+    active_probabilities = st.session_state.get("active_probabilities", {})
+    active_labels = [label for label, value in active_predictions.items() if value == 1]
+    if active_labels:
+        case_status = "已联动阳性标签：" + "，".join(f"{label}-{DISEASE_NAMES[label]}" for label in active_labels[:4])
+    elif active_probabilities:
+        top_label = max(active_probabilities, key=active_probabilities.get)
+        case_status = f"已联动最高风险：{top_label}-{DISEASE_NAMES[top_label]}（{active_probabilities[top_label]:.2f}）"
+    else:
+        case_status = "未选择诊断病例，可直接输入症状进行分诊辅助。"
+
+    rag_status = "检索依据已启用，提交后会自动匹配相关疾病、检查和转诊标准。" if _RAG_AVAILABLE else "检索依据暂不可用，回答将基于输入信息生成。"
+    st.markdown(
+        f"""
+        <div class="consult-status">
+          <div class="consult-status-card"><b>当前病例</b><span>{case_status}</span></div>
+          <div class="consult-status-card"><b>检索依据</b><span>{rag_status}</span></div>
+          <div class="consult-status-card"><b>安全边界</b><span>仅提供分诊沟通参考；红旗症状会优先提示立即就医。</span></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    if not st.session_state.chat_history:
-        st.markdown(
-            """
-            <div class="feature-grid">
-                <div class="feature-card"><h3>示例：急性症状</h3><p>突然出现飞蚊症和闪光感一天，应检查哪些危险信号？</p></div>
-                <div class="feature-card"><h3>示例：慢性模糊</h3><p>进行性视物模糊，夜间眩光增强，对比度下降。</p></div>
-                <div class="feature-card"><h3>示例：视网膜风险</h3><p>糖尿病史 12 年，新发中心视物模糊，OCT 提示黄斑水肿。</p></div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
+    st.markdown('<div class="soft-panel">', unsafe_allow_html=True)
     col_age, col_sex, col_history = st.columns(3)
     with col_age:
         patient_age = st.number_input("年龄", min_value=0, max_value=120, value=50, key="patient_age")
@@ -2430,10 +2191,14 @@ def ai_doctor_tab(user_avatar_b64: str, ai_avatar_b64: str):
         height=80,
         key="additional_info",
     )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.caption("本问诊助手已接入本地眼科知识库 RAG 检索；相关内容仅作为辅助参考，不替代医生面诊和最终诊断。")
+    st.markdown(
+        '<div class="consult-note">本问诊助手会在后台参考本地眼科知识库；相关内容仅作为辅助参考，不替代医生面诊和最终诊断。</div>',
+        unsafe_allow_html=True,
+    )
 
-    st.markdown("#### 对话记录")
+    st.markdown('<div class="consult-section-title">对话记录</div>', unsafe_allow_html=True)
     for message in st.session_state.chat_history:
         render_chat_message(message, user_avatar_b64, ai_avatar_b64)
     if st.session_state.awaiting_response:
@@ -2487,52 +2252,71 @@ def ai_doctor_tab(user_avatar_b64: str, ai_avatar_b64: str):
 
     if st.session_state.awaiting_response and st.session_state.chat_history:
         latest_user_msg = st.session_state.chat_history[-1]["content"]
+        patient_meta = st.session_state.get("active_patient_meta", {})
+        context_labels = [label for label, value in active_predictions.items() if value == 1]
+        if not context_labels and active_probabilities:
+            context_labels = [max(active_probabilities, key=active_probabilities.get)]
+        graph_context = {label: graph_neighbors(label) for label in context_labels}
+        multimodal_context = build_ai_consult_multimodal_context(
+            active_predictions=active_predictions,
+            active_probabilities=active_probabilities,
+            patient_meta=patient_meta,
+            disease_names=DISEASE_NAMES,
+            graph_neighbors=graph_context,
+            form_age=patient_age,
+            form_sex=patient_sex,
+            patient_history=patient_history,
+            symptoms=symptoms,
+            additional_info=additional_info,
+        )
 
         rag_context = ""
+        rag_evidence = {"results": [], "sources": [], "top_terms": [], "citation_ids": []}
         if _RAG_AVAILABLE:
-            rag_query = f"{symptoms} {additional_info} {patient_history}".strip()
+            rag_query = build_case_rag_query(symptoms, additional_info, patient_history, patient_age, patient_sex)
             try:
                 rag_context = _rag_module.build_context(rag_query, n_results=4)
+                rag_evidence = _rag_module.explain_query(rag_query, n_results=4)
+                st.session_state["last_rag_evidence"] = rag_evidence
             except Exception:
                 rag_context = ""
+                st.session_state["last_rag_evidence"] = rag_evidence
 
-        rag_section = (
-            f"\n\n请参考以下本地知识库检索结果，但不要把它当作唯一依据；如果与患者信息不匹配，应说明不确定性。\n{rag_context}\n"
-            if rag_context
-            else "\n\n本次未检索到可用的本地知识库片段，请仅基于患者提供的信息给出谨慎建议。\n"
+        messages = build_consult_messages(
+            st.session_state.chat_history,
+            case_context=multimodal_context,
+            evidence_context=rag_context,
         )
-        prompt = f"""你是一名眼科 AI 问诊辅助助手，只能提供分诊和沟通参考，不能作出最终诊断、不能替代医生面诊，也不能要求患者自行用药或延误就医。{rag_section}
-患者信息：
-{latest_user_msg}
-
-请使用中文，语气专业、克制、易懂。严格按照以下格式输出，不要省略任何一级标题：
-
-## 疾病风险等级
-**辅助分诊风险**：高 / 中 / 低（三选一，加粗显示）
-**判断依据**：（1-2 句话说明主要依据，并指出哪些信息仍不足）
-
-## 建议检查项目
-- （列出 3-5 项检查，并说明目的；优先包含视力、裂隙灯、眼压、眼底检查、OCT 等相关项目）
-
-## 初步处理建议
-（2-4 句话，说明就诊优先级、是否需要尽快眼科就诊、观察/复诊重点；不要给出处方）
-
-## 需要立即就医的情况
-- （列出与本病例相关的红旗症状；如突发视力下降、剧烈眼痛、外伤、闪光/大量飞蚊、视野缺损等）
-
-## 给医生的沟通要点
-- （帮助患者整理面诊时应提供的信息，如症状起始时间、单眼/双眼、基础病、既往手术、检查结果等）
----
-本回答仅为 AI 辅助建议，不能替代专业医生面诊、检查和最终医疗判断。"""
-
         response_placeholder = st.empty()
         try:
-            full_response = call_deepseek_api_stream(prompt, DEEPSEEK_API_KEY, response_placeholder)
-        except Exception as exc:
-            full_response = f"AI 服务暂时不可用：{exc}"
+            full_response = call_deepseek_api_stream(messages, DEEPSEEK_API_KEY, response_placeholder)
+            st.session_state["last_ai_mode"] = "deepseek"
+        except Exception:
+            full_response = (
+                "AI 服务暂时不可用，请检查 DEEPSEEK_API_KEY、网络连接和模型配置后重试。"
+            )
+            response_placeholder.error(full_response)
+            st.session_state["last_ai_mode"] = "error"
         st.session_state.chat_history.append({"role": "assistant", "content": full_response})
         st.session_state.awaiting_response = False
         st.rerun()
+
+    last_evidence = st.session_state.get("last_rag_evidence")
+    if last_evidence:
+        with st.expander("检索依据"):
+            st.caption(
+                "命中文档："
+                + (", ".join(last_evidence.get("sources", [])) or "无")
+                + "；关键词："
+                + ("、".join(last_evidence.get("top_terms", [])[:8]) or "无")
+            )
+            for index, result in enumerate(last_evidence.get("results", [])[:4], 1):
+                preview = str(result["text"]).replace("\n", " ")[:220]
+                st.markdown(
+                    f"- **[R{index}]** `{result['source']}` · "
+                    f"引用 `{result.get('citation_id', result.get('chunk_id', ''))}` · "
+                    f"score={result['score']}：{preview}..."
+                )
 
     with st.expander("使用提示"):
         st.markdown(
@@ -2543,13 +2327,341 @@ def ai_doctor_tab(user_avatar_b64: str, ai_avatar_b64: str):
             - AI 回复用于辅助分诊参考，不替代面对面的临床评估和最终诊断。
             """
         )
-    st.markdown("</div>", unsafe_allow_html=True)
+
+def diagnosis_tab(meta_df: pd.DataFrame, colors):
+    st.sidebar.markdown("### 推理设置")
+    cuda_available = torch.cuda.is_available()
+    gpu_requested = st.sidebar.checkbox("使用 GPU", value=cuda_available, disabled=not cuda_available)
+    if not cuda_available:
+        st.sidebar.caption("当前 Python 环境中 CUDA 不可用，推理将在 CPU 上运行。")
+    device = "cuda" if gpu_requested and cuda_available else "cpu"
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 图像输入")
+    upload_opt = st.sidebar.radio("来源", ["上传图像", "使用训练图像目录"])
+
+    images = []
+    if upload_opt == "上传图像":
+        left_file = st.sidebar.file_uploader("上传左眼眼底图像", type=["jpg", "jpeg", "png"], key="upload_left_eye")
+        right_file = st.sidebar.file_uploader("上传右眼眼底图像", type=["jpg", "jpeg", "png"], key="upload_right_eye")
+        if left_file or right_file:
+            if left_file and right_file:
+                left_img = Image.open(left_file).convert("RGB")
+                right_img = Image.open(right_file).convert("RGB")
+                case_name = f"{left_file.name} + {right_file.name}"
+                images.append(
+                    {
+                        "name": case_name,
+                        "merged_img": merge_eye_images(left_img, right_img),
+                        "left_img": left_img,
+                        "right_img": right_img,
+                        "source": "upload",
+                    }
+                )
+            else:
+                st.sidebar.warning("请同时上传左眼和右眼图像，才能进行双眼拼接和推理。")
+    else:
+        available_ids = sorted({int(p.name.split("_")[0]) for p in TRAIN_IMAGES_DIR.glob("*_left.jpg")})
+        patient_ids = st.sidebar.multiselect("选择患者编号", available_ids)
+        for pid in patient_ids:
+            left_path = TRAIN_IMAGES_DIR / f"{pid}_left.jpg"
+            right_path = TRAIN_IMAGES_DIR / f"{pid}_right.jpg"
+            if left_path.exists() and right_path.exists():
+                images.append(
+                    {
+                        "name": pid,
+                        "merged_img": image_merge(left_path, right_path),
+                        "left_img": Image.open(left_path).convert("RGB"),
+                        "right_img": Image.open(right_path).convert("RGB"),
+                        "source": "train",
+                    }
+                )
+            else:
+                st.sidebar.warning(f"患者 {pid} 缺少左眼或右眼图像。")
+
+    render_page_header(
+        "眼底诊断工作台",
+        "按照病例信息、图像审查、AI 风险结果和反馈记录完成一次可追溯的眼底病例审阅。",
+        ["图像核验", "风险筛查", "审查反馈"],
+    )
+
+    if not images:
+        st.markdown('<div class="empty-state">请在左侧栏选择或上传图像以开始诊断。</div>', unsafe_allow_html=True)
+        return
+
+    for case in images:
+        name = case["name"]
+        merged_img = case["merged_img"]
+        left_img = case["left_img"]
+        right_img = case["right_img"]
+        source_label = "训练目录" if case.get("source") == "train" else "上传图像"
+        patient_key = str(name).split("_")[0]
+        has_patient_id = patient_key.isdigit() and int(patient_key) in meta_df.index
+        age, sex = None, None
+        if has_patient_id:
+            age = meta_df.loc[int(patient_key), "Patient Age"]
+            sex = meta_df.loc[int(patient_key), "Patient Sex"]
+            header_title = f"患者 {patient_key}"
+            header_meta = f"年龄：{age} 岁 | 性别：{sex}"
+        else:
+            header_title = "上传图像"
+            header_meta = str(name)
+
+        st.markdown(
+            f"""
+            <div class="clinical-card" style="margin-top:4px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+                <div>
+                  <div style="color:#006b4e;font-size:12px;font-weight:850;letter-spacing:.08em;text-transform:uppercase;">Case Review</div>
+                  <h3 style="margin:6px 0 4px;color:#102a27;font-size:22px;">{header_title}</h3>
+                  <div style="color:#667874;font-size:13px;">{header_meta}</div>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                  <span class="disease-chip">Device: {device.upper()}</span>
+                  <span class="disease-chip">8-label screening</span>
+                  <span class="disease-chip">Swin Grad-CAM</span>
+                </div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""
+            <div class="meta-strip">
+              <div class="meta-pill"><b>病例来源</b><span>{html.escape(source_label)}</span></div>
+              <div class="meta-pill"><b>推理设备</b><span>{device.upper()}</span></div>
+              <div class="meta-pill"><b>筛查标签</b><span>{len(LABELS)} 类 ODIR 标签</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        left_path = TRAIN_IMAGES_DIR / f"{patient_key}_left.jpg"
+        right_path = TRAIN_IMAGES_DIR / f"{patient_key}_right.jpg"
+        cache_key = prediction_cache_key(name, merged_img, device)
+        if cache_key not in st.session_state:
+            with st.spinner("正在运行模型推理，请稍候..."):
+                st.session_state[cache_key] = predict_scores(merged_img, MODELS_DIR, device=device)
+        prediction_result = st.session_state[cache_key]
+        probs, preds = prediction_result.probs, prediction_result.preds
+
+        result_df = pd.DataFrame(
+            {
+                "Label": LABELS,
+                "Disease": [DISEASE_NAMES[label] for label in LABELS],
+                "Probability": np.round(probs, 2),
+                "Prediction": preds,
+            }
+        )
+
+        st.markdown('<div class="section-header"><h2>图像审查</h2><p>先做目视核验，再解读模型结果，避免只看概率数字。</p></div>', unsafe_allow_html=True)
+        img_left_col, img_right_col, img_merged_col = st.columns([0.95, 0.95, 2.1], gap="medium")
+        with img_left_col:
+            render_diagnostic_image(left_img, caption="左眼", max_width=240, max_height=220)
+        with img_right_col:
+            render_diagnostic_image(right_img, caption="右眼", max_width=240, max_height=220)
+        with img_merged_col:
+            render_diagnostic_image(merged_img, caption="双眼拼接图像", max_width=560, max_height=260)
+
+        image_quality = assess_image_quality(merged_img)
+
+        st.session_state["active_patient_id"] = str(patient_key)
+        st.session_state["active_predictions"] = {label: int(pred) for label, pred in zip(LABELS, preds)}
+        st.session_state["active_probabilities"] = {label: float(prob) for label, prob in zip(LABELS, probs)}
+        left_keywords = ""
+        right_keywords = ""
+        if has_patient_id:
+            left_keywords = meta_df.loc[int(patient_key)].get("Left-Diagnostic Keywords", "")
+            right_keywords = meta_df.loc[int(patient_key)].get("Right-Diagnostic Keywords", "")
+        st.session_state["active_patient_meta"] = {
+            "age": age,
+            "sex": sex,
+            "left_keywords": left_keywords,
+            "right_keywords": right_keywords,
+        }
+        st.session_state["active_quality_summary"] = image_quality["overall"]
+
+        st.markdown('<div class="section-header"><h2>AI 分析结果</h2><p>风险条用于快速扫描，热图用于解释模型关注区域。</p></div>', unsafe_allow_html=True)
+        result_col, cam_col = st.columns([1.12, 0.88], gap="large")
+        with result_col:
+            render_review_summary(result_df)
+            render_risk_panel(result_df)
+            render_comorbidity_alert(result_df)
+            st.markdown(
+                '<div class="quiet-note">模型输出仅供审查参考。若图像质量、症状或临床病史与结果相悖，应优先遵循临床判断。</div>',
+                unsafe_allow_html=True,
+            )
+
+        with cam_col:
+            st.markdown("##### 模型注意力热图（Swin Grad-CAM）")
+            default_idx = int(np.argmax(probs))
+            selected_cam_label = st.selectbox(
+                "选择关注的疾病标签",
+                LABELS,
+                index=default_idx,
+                format_func=lambda lbl: f"{lbl} - {DISEASE_NAMES[lbl]}",
+                key=f"cam_label_{name}",
+            )
+            cam_index = LABELS.index(selected_cam_label)
+            cam_cache_key = f"{cache_key}_cam_{selected_cam_label}"
+            if cam_cache_key not in st.session_state:
+                with st.spinner("正在生成所选标签的注意力热图..."):
+                    st.session_state[cam_cache_key] = generate_cam(
+                        merged_img,
+                        selected_cam_label,
+                        MODELS_DIR,
+                        device=device,
+                    )
+            cam_result = st.session_state[cam_cache_key]
+            if cam_result.image is not None:
+                render_cam_image(
+                    cam_result.image,
+                    caption=f"Swin Grad-CAM - {DISEASE_NAMES[selected_cam_label]}",
+                    max_width=460,
+                    max_height=300,
+                )
+                st.caption(f"该标签预测概率：{float(probs[cam_index]):.1%}")
+            else:
+                render_cam_image(merged_img, caption="原始双眼图像", max_width=460, max_height=300)
+                st.caption("注意力热图暂不可用，已显示原始图像。")
+
+            with st.expander("运行信息"):
+                st.caption(
+                    f"模型版本：{prediction_result.model_version} · "
+                    f"设备：{prediction_result.device.upper()} · "
+                    f"TTA：{'开启' if prediction_result.tta_enabled else '关闭'} · "
+                    f"推理：{prediction_result.inference_ms:.0f} ms · "
+                    f"热图：{cam_result.generation_ms:.0f} ms"
+                )
+
+            st.markdown("##### 医生审查反馈")
+            with st.form(key=f"feedback_{name}", clear_on_submit=False):
+                doctor_ok = st.radio("临床审查结果", ["正确", "不正确"], horizontal=True, key=f"radio_{name}")
+                confidence = st.slider("审查者信心", min_value=1, max_value=5, value=4, key=f"confidence_{name}")
+                flag_for_review = st.checkbox("标记此病例待复查", key=f"flag_{name}")
+                feedback_comment = st.text_area(
+                    "临床备注",
+                    placeholder="不一致原因、图像质量问题、疑似标签、随访安排等。",
+                    key=f"comment_{name}",
+                )
+                submitted = st.form_submit_button("提交反馈", type="primary")
+                if submitted:
+                    try:
+                        saved_feedback = save_feedback(
+                            name,
+                            probs,
+                            preds,
+                            doctor_ok == "正确",
+                            confidence=confidence,
+                            comment=feedback_comment,
+                            flag_for_review=flag_for_review,
+                        )
+                        st.session_state[f"feedback_saved_{name}"] = saved_feedback
+                        st.session_state.pop(f"feedback_error_{name}", None)
+                    except Exception:
+                        st.session_state.pop(f"feedback_saved_{name}", None)
+                        st.session_state[f"feedback_error_{name}"] = True
+            saved_feedback = st.session_state.get(f"feedback_saved_{name}")
+            if saved_feedback:
+                st.success("反馈已保存至本地记录。")
+            elif st.session_state.get(f"feedback_error_{name}"):
+                st.error("反馈保存失败，请检查当前存储配置后重试。")
+
+        st.divider()
+
+
+def render_hero():
+    st.markdown(
+        """
+        <div class="clinical-hero">
+          <div class="hero-layout">
+            <div>
+              <div class="hero-kicker">RetinaScope Eye Center Suite</div>
+              <h1>AI 智能眼底诊断工作站</h1>
+              <p>面向眼底筛查、临床复核和模型改进闭环，把双眼图像、风险标签、Swin Grad-CAM 热图、知识图谱和医生反馈放进同一条清晰工作流。</p>
+              <div class="hero-chips">
+                <span class="disease-chip">双眼眼底图像</span>
+                <span class="disease-chip">8 类风险标签</span>
+                <span class="disease-chip">知识图谱联动</span>
+                <span class="disease-chip">反馈可追溯</span>
+              </div>
+            </div>
+            <div class="hero-status-grid">
+              <div class="stat-card"><div class="stat-label">核心流程</div><div class="stat-value">诊断审阅</div><div class="metric-hint">选择或上传眼底图像，运行模型推理并查看风险结果。</div></div>
+              <div class="stat-card"><div class="stat-label">解释方式</div><div class="stat-value">图谱联动</div><div class="metric-hint">风险条、热图和知识图谱互相补位。</div></div>
+              <div class="stat-card"><div class="stat-label">反馈闭环</div><div class="stat-value">医生标注</div><div class="metric-hint">保存正确性、置信度、复查标记和临床备注。</div></div>
+              <div class="stat-card"><div class="stat-label">辅助问诊</div><div class="stat-value">检索问答</div><div class="metric-hint">结合症状、病史和本地知识库生成分诊参考。</div></div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def overview_tab(meta_df: pd.DataFrame):
+    render_hero()
+    review_img = local_image_data_uri("assets/overview/archive-review.png")
+    evidence_img = local_image_data_uri("assets/overview/evidence-graph.png")
+    case_img = local_image_data_uri("assets/overview/case-review.png")
+    st.markdown(
+        f"""
+        <div class="overview-panel">
+          <div>
+            <div class="overview-copy">
+              <div class="section-kicker">Diagnosis Flow</div>
+              <h2>系统诊断流程</h2>
+              <p>系统围绕一次眼底病例审查展开：先输入双眼图像，再运行模型筛查，随后查看热图和知识图谱，最后保存人工反馈。</p>
+            </div>
+            <div class="overview-flow" style="margin-top:10px;">
+              <div class="flow-item"><strong>01 图像输入</strong><span>上传眼底图像，或从训练目录选择患者病例。</span></div>
+              <div class="flow-item"><strong>02 AI 筛查</strong><span>输出 8 类眼底疾病风险概率和阳性提示。</span></div>
+              <div class="flow-item"><strong>03 结果解释</strong><span>结合热图、知识图谱和检索依据辅助复核。</span></div>
+              <div class="flow-item"><strong>04 反馈记录</strong><span>保存错误标注、复查状态和备注信息。</span></div>
+            </div>
+          </div>
+          <div>
+            <div class="overview-carousel">
+              <div class="overview-slide">
+                <img src="{review_img}" alt="眼底图像审查工作台">
+                <div class="overview-slide-caption"><strong>病例信息确认</strong><span>先确认病例背景与双眼图像来源。</span></div>
+              </div>
+              <div class="overview-slide">
+                <img src="{evidence_img}" alt="知识图谱证据联动界面">
+                <div class="overview-slide-caption"><strong>结果解释与复核</strong><span>将模型提示转化为可沟通、可复核的临床线索。</span></div>
+              </div>
+              <div class="overview-slide">
+                <img src="{case_img}" alt="眼科病例复核界面">
+                <div class="overview-slide-caption"><strong>反馈闭环</strong><span>保存审查结论、复查状态和人工标注记录。</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main():
-    st.set_page_config("Ophthalmic AI Assistant", layout="wide")
+    st.set_page_config("RetinaScope", layout="wide")
     colors = inject_theme(True)
     inject_night_refinement(colors)
+
+    with st.sidebar:
+        st.markdown(
+            """
+            <div class="sidebar-brand">
+              <span class="sidebar-brand-mark">RS</span>
+              <span class="sidebar-brand-text">
+                <div class="sidebar-brand-title">RetinaScope</div>
+                <div class="sidebar-brand-subtitle">AI 智能眼底诊断工作站</div>
+              </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(f'<div class="quiet-copyright">{COPYRIGHT_TEXT}</div>', unsafe_allow_html=True)
 
     meta_df = load_metadata()
     if "chat_history" not in st.session_state:
@@ -2560,22 +2672,20 @@ def main():
     user_avatar_b64 = image_to_base64(create_avatar(colors["user"], "patient"))
     ai_avatar_b64 = image_to_base64(create_avatar(colors["assistant"], "doctor"))
 
-    tab_overview, tab_main, tab_knowledge, tab_errors, tab_stats, tab_ai_doctor = st.tabs(
-        ["概览", "眼底诊断", "知识图谱", "错误病例", "数据集统计", "AI 问诊"]
-    )
-    with tab_overview:
+    tab_names = ["概览", "眼底诊断", "知识图谱", "错误病例", "AI 问诊"]
+    tabs = st.tabs(tab_names)
+    with tabs[0]:
         overview_tab(meta_df)
-    with tab_main:
+    with tabs[1]:
         diagnosis_tab(meta_df, colors)
-    with tab_knowledge:
+    with tabs[2]:
         knowledge_tab()
-    with tab_errors:
+    with tabs[3]:
         errors_tab()
-    with tab_stats:
-        stats_tab(meta_df, colors)
-    with tab_ai_doctor:
+    with tabs[4]:
         ai_doctor_tab(user_avatar_b64, ai_avatar_b64)
 
 
 if __name__ == "__main__":
     main()
+

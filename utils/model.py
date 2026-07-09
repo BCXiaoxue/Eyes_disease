@@ -1,20 +1,21 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
+import json
 import os
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
-import torch.nn as nn
 from PIL import Image
-from torchcam.methods import GradCAMpp
-from torchcam.utils import overlay_mask
-from torchvision import models, transforms
-from torchvision.transforms.functional import to_pil_image
+from torchvision import transforms
+
+from utils.binocular_label_graph import load_experiment_checkpoint
 
 
-# Streamlit's source watcher may inspect torch.classes.__path__ and trigger
-# a harmless but noisy PyTorch custom-class error. Make it a normal path-like
-# value before Streamlit scans loaded modules.
 try:
     torch.classes.__path__ = []
 except Exception:
@@ -23,10 +24,9 @@ except Exception:
 
 LABELS = ["N", "D", "G", "C", "A", "H", "M", "O"]
 IMG_SIZE = (512, 512)
-DISEASE_THRESHOLD_FLOOR = float(os.getenv("RETINASCOPE_DISEASE_THRESHOLD_FLOOR", "0.50"))
-NORMAL_THRESHOLD_FLOOR = float(os.getenv("RETINASCOPE_NORMAL_THRESHOLD_FLOOR", "0.50"))
-MAX_POSITIVE_DISEASES = int(os.getenv("RETINASCOPE_MAX_POSITIVE_DISEASES", "1"))
-ENABLE_SCORECAM = os.getenv("RETINASCOPE_ENABLE_SCORECAM", "1").strip() == "1"
+MODEL_FILENAME = os.getenv("RETINASCOPE_MODEL_FILE", "best_swin_tiny_linear_asl.pth")
+ENABLE_TTA = os.getenv("RETINASCOPE_ENABLE_TTA", "1").strip() == "1"
+TTA_EVAL_FILENAME = os.getenv("RETINASCOPE_TTA_EVAL_FILE", "eval_swin_tiny_linear_asl_tta.json")
 IMG_TF = transforms.Compose(
     [
         transforms.Resize(IMG_SIZE),
@@ -36,106 +36,198 @@ IMG_TF = transforms.Compose(
 )
 
 
-def calibrate(p_raw: float, th: float, temp: float = 2.0) -> float:
-    # Treat the learned threshold as the logistic midpoint.
-    z = (p_raw - th) * temp / (th * (1 - th) + 1e-6)
-    return float(1 / (1 + np.exp(-z)))
+@dataclass(frozen=True)
+class PredictionResult:
+    probs: np.ndarray
+    preds: np.ndarray
+    thresholds: np.ndarray
+    model_version: str
+    device: str
+    tta_enabled: bool
+    inference_ms: float
 
 
-def effective_threshold(label: str, learned_threshold: float) -> float:
-    floor = NORMAL_THRESHOLD_FLOOR if label == "N" else DISEASE_THRESHOLD_FLOOR
-    return max(float(learned_threshold), floor)
+@dataclass(frozen=True)
+class CamResult:
+    label: str
+    image: Image.Image | None
+    error: str
+    generation_ms: float
 
 
-class ResNetBinary(nn.Module):
-    def __init__(self, pretrained: bool = True):
-        super().__init__()
-        base = models.convnext_base(
-            weights=models.ConvNeXt_Base_Weights.IMAGENET1K_V1 if pretrained else None
-        )
-        self.backbone = nn.Sequential(*list(base.children())[:-1])
-        in_ch = 1024
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(in_ch, eps=1e-6),
-            nn.Flatten(1),
-            nn.Linear(in_ch, 1),
-        )
-
-    def forward(self, x):
-        x = self.backbone(x)[:, :, 0, 0]
-        return self.classifier(x)
+def _resolve_model_path(models_dir: str | Path) -> Path:
+    models_dir = Path(models_dir)
+    preferred = models_dir / MODEL_FILENAME
+    if preferred.exists():
+        return preferred
+    candidates = sorted(models_dir.glob("best_swin*_asl.pth"))
+    return candidates[0] if candidates else preferred
 
 
-@lru_cache(maxsize=32)
-def _load_label_model(label: str, models_dir: str, device: str):
-    ckpt_path = Path(models_dir) / f"best_{label}_fold5.pth"
+def _resolve_tta_eval_path(models_dir: str | Path) -> Path:
+    return Path(models_dir) / TTA_EVAL_FILENAME
+
+
+def _file_fingerprint(path: Path) -> str:
+    if not path.exists():
+        return "missing"
+    stat = path.stat()
+    raw = f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def get_model_fingerprint(models_dir: str | Path) -> str:
+    model_path = _resolve_model_path(models_dir)
+    eval_path = _resolve_tta_eval_path(models_dir)
+    raw = f"{_file_fingerprint(model_path)}:{_file_fingerprint(eval_path)}:tta={int(ENABLE_TTA)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+@lru_cache(maxsize=4)
+def _load_multilabel_model(models_dir: str, device: str, fingerprint: str):
+    del fingerprint
+    ckpt_path = _resolve_model_path(models_dir)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
-
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model = ResNetBinary(pretrained=False).to(device)
-    model.load_state_dict(ckpt["state_dict"], strict=False)
-    model.eval()
-    threshold = float(ckpt.get("threshold", 0.5))
-    return model, threshold
+    return load_experiment_checkpoint(ckpt_path, device=device)
 
 
-def _safe_gradcam(model, x, display_image):
-    if not ENABLE_SCORECAM:
-        return display_image.copy(), None
+@lru_cache(maxsize=8)
+def _load_threshold_override(models_dir: str, fingerprint: str) -> np.ndarray | None:
+    del fingerprint
+    eval_path = _resolve_tta_eval_path(models_dir)
+    if not eval_path.exists():
+        return None
     try:
-        cam_extractor = GradCAMpp(model, target_layer="backbone.0.7")
-        with torch.enable_grad():
-            out = model(x.clone().requires_grad_(True))
-            activation_map = cam_extractor(class_idx=0, scores=out)
-        cam_extractor.remove_hooks()
-        return overlay_mask(
-            display_image,
-            to_pil_image(activation_map[0].squeeze(0), mode="F"),
-            alpha=0.55,
-        ), None
-    except Exception as exc:
-        return display_image.copy(), str(exc)
+        data = json.loads(eval_path.read_text(encoding="utf-8"))
+        thresholds = data["calibrated_threshold_metrics"]["thresholds"]
+        return np.array([float(thresholds[label]) for label in LABELS], dtype=np.float32)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
-def predict(image: Image.Image, models_dir: Path, device="cpu"):
-    """Return probs(8,), preds(8,), ScoreCAM images, and CAM error messages."""
+def _normalise_device(device: str) -> str:
     if str(device).startswith("cuda") and not torch.cuda.is_available():
-        device = "cpu"
+        raise RuntimeError("CUDA was requested but is not available")
+    return str(device)
 
-    device = str(device)
+
+def _predict_logits(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    logits = model(x)
+    if ENABLE_TTA:
+        logits = (logits + model(torch.flip(x, dims=[3]))) / 2.0
+    return logits
+
+
+def _apply_thresholds(probs: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
+    thresholds = np.asarray(thresholds, dtype=np.float32)
+    if thresholds.shape != (len(LABELS),):
+        thresholds = np.full(len(LABELS), 0.5, dtype=np.float32)
+    preds = (np.asarray(probs, dtype=np.float32) >= thresholds).astype(int)
+    if preds[1:].any():
+        preds[0] = 0
+    elif preds[0] == 0:
+        preds[0] = 1
+    return preds
+
+
+def predict_scores(image: Image.Image, models_dir: str | Path, device: str = "cpu") -> PredictionResult:
+    device = _normalise_device(device)
     models_dir = str(Path(models_dir).resolve())
+    fingerprint = get_model_fingerprint(models_dir)
     image = image.convert("RGB")
     x = IMG_TF(image).unsqueeze(0).to(device)
-    display_image = image.resize(IMG_SIZE)
-    probs, thresholds, cams, cam_errors = [], [], [], {}
+    model, checkpoint_thresholds, _metadata = _load_multilabel_model(models_dir, device, fingerprint)
 
-    for label in LABELS:
-        model, threshold = _load_label_model(label, models_dir, device)
+    started = time.perf_counter()
+    with torch.inference_mode():
+        logits = _predict_logits(model, x)
+    inference_ms = (time.perf_counter() - started) * 1000.0
 
-        with torch.inference_mode():
-            logit = model(x)
-        result, cam_error = _safe_gradcam(model, x, display_image)
-        cams.append(result)
-        if cam_error:
-            cam_errors[label] = cam_error
+    probs = torch.sigmoid(logits).detach().cpu().numpy()[0].astype(np.float32)
+    thresholds = _load_threshold_override(models_dir, fingerprint)
+    if thresholds is None:
+        thresholds = np.asarray(checkpoint_thresholds, dtype=np.float32)
+    if thresholds.shape != (len(LABELS),):
+        thresholds = np.full(len(LABELS), 0.5, dtype=np.float32)
+    preds = _apply_thresholds(probs, thresholds)
+    return PredictionResult(
+        probs=probs,
+        preds=preds,
+        thresholds=thresholds,
+        model_version=fingerprint,
+        device=device,
+        tta_enabled=ENABLE_TTA,
+        inference_ms=round(inference_ms, 1),
+    )
 
-        p_raw = torch.sigmoid(logit).item()
-        probs.append(float(p_raw))
-        thresholds.append(effective_threshold(label, threshold))
 
-    probs_np = np.array(probs, dtype=np.float32)
-    thresholds_np = np.array(thresholds, dtype=np.float32)
-    preds_np = (probs_np >= thresholds_np).astype(int)
+def _heatmap_overlay(image: Image.Image, cam: np.ndarray, alpha: float = 0.45) -> Image.Image:
+    cam = np.clip(cam, 0.0, 1.0)
+    heat = np.zeros((*cam.shape, 3), dtype=np.uint8)
+    heat[..., 0] = np.clip(255 * np.minimum(1.0, cam * 2.0), 0, 255).astype(np.uint8)
+    heat[..., 1] = np.clip(255 * np.maximum(0.0, (cam - 0.35) * 1.6), 0, 255).astype(np.uint8)
+    heat[..., 2] = np.clip(120 * np.maximum(0.0, 1.0 - cam * 2.5), 0, 255).astype(np.uint8)
+    heat_img = Image.fromarray(heat, mode="RGB").resize(image.size, Image.BICUBIC)
+    return Image.blend(image.convert("RGB"), heat_img, alpha=alpha)
 
-    disease_indices = list(range(1, len(LABELS)))
-    positive_diseases = [idx for idx in disease_indices if preds_np[idx] == 1]
-    if MAX_POSITIVE_DISEASES > 0 and len(positive_diseases) > MAX_POSITIVE_DISEASES:
-        keep = sorted(positive_diseases, key=lambda idx: probs_np[idx], reverse=True)[:MAX_POSITIVE_DISEASES]
-        for idx in positive_diseases:
-            preds_np[idx] = 1 if idx in keep else 0
 
-    if preds_np[1:].any():
-        preds_np[0] = 0
+def generate_cam(
+    image: Image.Image,
+    label: str,
+    models_dir: str | Path,
+    device: str = "cpu",
+) -> CamResult:
+    if label not in LABELS:
+        return CamResult(label=label, image=None, error=f"Unknown label: {label}", generation_ms=0.0)
 
-    return probs_np, preds_np, cams, cam_errors
+    device = _normalise_device(device)
+    models_dir = str(Path(models_dir).resolve())
+    fingerprint = get_model_fingerprint(models_dir)
+    source_image = image.convert("RGB")
+    display_image = source_image.resize(IMG_SIZE)
+    x = IMG_TF(source_image).unsqueeze(0).to(device)
+    model, _thresholds, _metadata = _load_multilabel_model(models_dir, device, fingerprint)
+    handle = None
+    started = time.perf_counter()
+    try:
+        target_layer = dict(model.named_modules()).get("backbone.norm")
+        if target_layer is None:
+            raise RuntimeError("target layer backbone.norm not found")
+        activations = []
+
+        def save_activation(_module, _inputs, output):
+            output.retain_grad()
+            activations.append(output)
+
+        handle = target_layer.register_forward_hook(save_activation)
+        model.zero_grad(set_to_none=True)
+        with torch.enable_grad():
+            logits = model(x.detach().clone().requires_grad_(True))
+            if not activations:
+                raise RuntimeError("target activation was not captured")
+            activation = activations[-1]
+            logits[0, LABELS.index(label)].backward()
+            grad = activation.grad
+            if grad is None:
+                raise RuntimeError("target gradient was not captured")
+            act = activation.detach()
+            if act.ndim == 4 and act.shape[-1] >= act.shape[1]:
+                weights = grad.mean(dim=(1, 2), keepdim=True)
+                cam = torch.relu((act * weights).sum(dim=-1))[0]
+            elif act.ndim == 4:
+                weights = grad.mean(dim=(2, 3), keepdim=True)
+                cam = torch.relu((act * weights).sum(dim=1))[0]
+            else:
+                raise RuntimeError(f"unsupported activation shape: {tuple(act.shape)}")
+            cam = cam - cam.min()
+            cam_np = (cam / cam.max().clamp(min=1e-6)).detach().cpu().numpy()
+            output = _heatmap_overlay(display_image, cam_np)
+        elapsed = (time.perf_counter() - started) * 1000.0
+        return CamResult(label=label, image=output, error="", generation_ms=round(elapsed, 1))
+    except Exception as exc:
+        elapsed = (time.perf_counter() - started) * 1000.0
+        return CamResult(label=label, image=None, error=f"Swin Grad-CAM 生成失败：{exc}", generation_ms=round(elapsed, 1))
+    finally:
+        if handle is not None:
+            handle.remove()

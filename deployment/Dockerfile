@@ -33,12 +33,13 @@ COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY app.py .
+COPY assets/ assets/
 COPY training/ training/
 COPY utils/ utils/
 COPY knowledge/ knowledge/
 
 RUN mkdir -p artifacts/models artifacts/new_models artifacts/feedback \
-    artifacts/reports artifacts/figs artifacts/logs data train/images test/images
+    artifacts/figs artifacts/logs data train/images test/images
 
 RUN mkdir -p /root/.streamlit
 COPY --chown=root:root deployment/streamlit_config.toml /root/.streamlit/config.toml

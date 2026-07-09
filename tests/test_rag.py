@@ -1,49 +1,44 @@
-"""Quick smoke test for the RAG pipeline. Run from project root:
-    python tests/test_rag.py
-"""
-import sys, time
-from pathlib import Path
+import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+from utils.rag import build_context, explain_query, rag_status, rebuild_index, retrieve
 
-print("=" * 60)
-print("RAG Smoke Test")
-print("=" * 60)
 
-# 1. status (no model load)
-print("\n[1] rag_status() (lightweight) ...")
-t0 = time.time()
-from utils.rag import rag_status
-s = rag_status()
-print(f"    took {time.time()-t0:.2f}s")
-for k, v in s.items():
-    print(f"    {k}: {v}")
+class RagTests(unittest.TestCase):
+    def test_clinical_source_ranking(self):
+        cases = [
+            ("糖尿病视网膜病变 糖网 黄斑水肿", "diabetic_retinopathy.md"),
+            ("青光眼 眼压升高 视野缺损 RNFL OCT", "glaucoma.md"),
+            ("白内障 眩光 视物模糊 裂隙灯", "cataract.md"),
+        ]
+        for query, expected_source in cases:
+            with self.subTest(query=query):
+                results = retrieve(query, n_results=3)
+                self.assertTrue(results)
+                self.assertEqual(results[0]["source"], expected_source)
+                self.assertEqual(len({result["source"] for result in results}), len(results))
+                self.assertTrue(all(result["citation_id"] for result in results))
 
-if not s.get("available"):
-    print("\n[SKIP] RAG not available:", s.get("reason"))
-    sys.exit(0)
+    def test_red_flag_forces_referral_source_first(self):
+        results = retrieve("突然视力下降 大量飞蚊 闪光 幕布感", n_results=3)
+        self.assertTrue(results)
+        self.assertEqual(results[0]["source"], "referral_standards.md")
 
-# 2. rebuild in-memory lexical index
-print("\n[2] rebuild_index() (local lexical index) ...")
-t0 = time.time()
-from utils.rag import rebuild_index
-r = rebuild_index()
-print(f"    took {time.time()-t0:.1f}s  →  {r}")
+    def test_structured_evidence_and_context(self):
+        evidence = explain_query("青光眼 眼压升高", n_results=2)
+        self.assertEqual(evidence["result_count"], 2)
+        self.assertIn("glaucoma.md", evidence["sources"])
+        self.assertEqual(len(evidence["citation_ids"]), 2)
+        context = build_context("青光眼 眼压升高", n_results=2)
+        self.assertIn("眼科知识库参考", context)
+        self.assertIn("[R1]", context)
+        self.assertIn("引用ID", context)
 
-# 3. retrieve
-print("\n[3] retrieve('糖尿病视网膜病变 飞蚊症', n_results=3) ...")
-t0 = time.time()
-from utils.rag import retrieve
-chunks = retrieve("糖尿病视网膜病变 飞蚊症", n_results=3)
-print(f"    took {time.time()-t0:.2f}s  →  {len(chunks)} chunks")
-for i, c in enumerate(chunks, 1):
-    print(f"    [{i}] {c[:80]}...")
+    def test_status_and_rebuild(self):
+        self.assertTrue(rag_status()["available"])
+        rebuilt = rebuild_index()
+        self.assertTrue(rebuilt["ok"])
+        self.assertGreaterEqual(rebuilt["chunks"], 8)
 
-# 4. build_context
-print("\n[4] build_context('青光眼 眼压升高') ...")
-from utils.rag import build_context
-ctx = build_context("青光眼 眼压升高", n_results=2)
-print(ctx[:300])
 
-print("\n[OK] All tests passed.")
+if __name__ == "__main__":
+    unittest.main()

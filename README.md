@@ -1,27 +1,106 @@
-# RetinaScope | 眼底疾病智能筛查与辅助问诊系统
+# RetinaScope
 
-## 项目简介
+RetinaScope is a local Streamlit app for binocular fundus image review, multi-label ODIR-style risk prediction, Grad-CAM visualization, local knowledge retrieval, AI consultation, and file-backed reviewer feedback.
 
-RetinaScope 是一套面向眼底疾病筛查场景的智能辅助系统。系统以左右眼底图像为输入，提供八类疾病的多标签风险预测、图像质量评估、可解释热力图展示与结构化辅助报告生成，并结合本地眼科知识库和大模型能力，为筛查、复核与问诊沟通提供参考。
+This project is for graduation design, research demos, and screening assistance. It does not replace professional ophthalmic diagnosis or treatment decisions.
 
-> 本项目用于科研展示与筛查辅助，不替代专业医生诊断或治疗决策。
+## Quick Start
 
-## 功能亮点
+```powershell
+cd D:\U_files\project_code\eyes_diseases_code
+python -m streamlit run app.py
+```
 
-| 功能 | 说明 |
+Run tests:
+
+```powershell
+python -B -m unittest discover -s tests -v
+```
+
+Optional model smoke test:
+
+```powershell
+python -B scripts\smoke_model.py --device cpu
+python -B scripts\smoke_model.py --device cuda
+```
+
+## Main Features
+
+- Separate left-eye and right-eye image upload.
+- Training-directory case selection from `train/images/<id>_left.jpg` and `<id>_right.jpg`.
+- Side-by-side binocular stitching before model inference.
+- 8-label risk output with calibrated thresholds.
+- On-demand Swin Grad-CAM visualization.
+- Local Markdown knowledge retrieval from `knowledge/*.md`.
+- AI consultation through the DeepSeek OpenAI-compatible API.
+- Local JSONL feedback storage in `artifacts/feedback/`.
+
+The app opens directly to the workspace and stores reviewer feedback locally.
+
+## Key Paths
+
+| Path | Purpose |
 | --- | --- |
-| 多标签眼底筛查 | 支持正常、糖尿病视网膜病变、青光眼、白内障、AMD、高血压视网膜病变、病理性近视及其他异常识别 |
-| 图像质量评估 | 检测清晰度、亮度与图像可用性，辅助识别低质量输入风险 |
-| 可解释可视化 | 通过 GradCAM++ 热力图展示模型关注区域，提升结果可理解性 |
-| 智能报告生成 | 根据预测结果生成结构化辅助报告，便于复核与展示 |
-| 本地知识增强 | 基于眼科知识库的轻量检索，为辅助问诊提供参考上下文 |
-| 反馈闭环 | 支持医生反馈、复查标记与病例记录的本地保存 |
-| 工程化交付 | 提供模型训练、评估测试及 Docker 部署配置 |
+| `app.py` | Streamlit UI and workflow entry point |
+| `utils/model.py` | Model loading, prediction, and Grad-CAM helpers |
+| `utils/binocular_label_graph.py` | Binocular multi-label experiment model utilities |
+| `utils/rag.py` | Local Markdown retrieval |
+| `utils/consult.py` | AI consultation message construction |
+| `utils/logger.py` | Feedback save/load entry point |
+| `utils/storage.py` | Local JSONL feedback persistence |
+| `utils/paths.py` | Project path constants |
+| `knowledge/` | Local ophthalmology knowledge files |
+| `assets/overview/` | Overview page images |
+| `artifacts/models/` | Runtime model checkpoints and evaluation metadata |
+| `artifacts/feedback/` | Local reviewer feedback records |
+| `training/` | Training and evaluation scripts |
+| `tests/` | Unit tests |
+| `deployment/` | Docker and Streamlit deployment config |
 
-## 技术栈
+## Environment
 
-`Python` · `Streamlit` · `PyTorch` · `Torchvision` · `TorchCAM` · `Pandas` · `Altair` · `Docker Compose`
+Copy `.env.example` to `.env` when local secrets or model overrides are needed.
 
-## 公开发布说明
+```env
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
+DEEPSEEK_API_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
 
-为保护密钥安全、数据隐私并控制仓库体积，本仓库不上传 API Key、模型权重文件、病例/反馈记录及其他敏感运行数据。
+RETINASCOPE_MODEL_FILE=best_swin_tiny_linear_asl.pth
+RETINASCOPE_ENABLE_TTA=1
+RETINASCOPE_TTA_EVAL_FILE=eval_swin_tiny_linear_asl_tta.json
+```
+
+## Data And Artifacts
+
+Expected runtime inputs:
+
+- `data/label.csv`
+- `train/images/*_left.jpg`
+- `train/images/*_right.jpg`
+- `knowledge/*.md`
+- `assets/overview/*.png`
+- `artifacts/models/best_swin_tiny_linear_asl.pth`
+- `artifacts/models/eval_swin_tiny_linear_asl_tta.json`
+
+Generated local feedback is written under `artifacts/feedback/`.
+
+## Deployment
+
+Validate Docker Compose config:
+
+```powershell
+docker compose -f deployment\docker-compose.yml config --quiet
+```
+
+Run with Docker Compose:
+
+```powershell
+docker compose -f deployment\docker-compose.yml up --build
+```
+
+## Notes
+
+- Do not commit `.env`, API keys, database files, real patient data, or private model checkpoints.
+- The app writes feedback locally by design.
+- If CUDA is explicitly requested and unavailable, model utilities raise an error instead of silently falling back to CPU.
